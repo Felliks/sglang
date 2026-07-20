@@ -29,6 +29,8 @@ class _FakeReq:
         self.rid = rid
         self.to_finish = None
         self.beam_group = None
+        self.session = None
+        self.mamba_pool_idx = None
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []
