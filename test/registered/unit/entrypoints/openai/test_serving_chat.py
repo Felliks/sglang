@@ -337,16 +337,33 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(request.model_dump(), body)
         self.assertFalse(hasattr(request, "conversation_id"))
 
-    def test_convert_to_internal_request_rejects_stream_token_ids(self):
-        for field in ("return_prompt_token_ids", "return_token_ids"):
-            req = ChatCompletionRequest(
-                model="x",
-                messages=[{"role": "user", "content": "Hi?"}],
-                stream=True,
-                **{field: True},
+    def test_convert_to_internal_request_rejects_stream_prompt_token_ids(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            return_prompt_token_ids=True,
+        )
+        with self.assertRaisesRegex(ValueError, "return_prompt_token_ids"):
+            self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_convert_to_internal_request_accepts_stream_token_ids(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            return_token_ids=True,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
             )
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
-                self.chat._convert_to_internal_request(req, self.fastapi_request)
+        self.assertTrue(adapted_request.return_prompt_token_ids)
 
     def test_validate_request_rejects_sampling_mask_without_meta_info(self):
         req = ChatCompletionRequest(
@@ -2425,6 +2442,66 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    def test_streaming_token_ids_emit_final_response_level_sglext(self):
+        async def _mock_generate_with_token_ids():
+            yield {
+                "text": "Hello",
+                "output_ids": [21],
+                "prompt_token_ids": [11, 12, 13],
+                "meta_info": {
+                    "id": "chatcmpl-token-id-stream",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+            yield {
+                "text": " world",
+                "output_ids": [22],
+                "prompt_token_ids": [11, 12, 13],
+                "meta_info": {
+                    "id": "chatcmpl-token-id-stream",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_with_token_ids()
+        self.tm.server_args.incremental_streaming_output = True
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            return_token_ids=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+        parsed = self._parse_chunks(chunks)
+        sglext_chunks = [chunk for chunk in parsed if chunk.get("sglext")]
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["choices"], [])
+        self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [11, 12, 13])
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [21, 22])
 
     def _collect_continuous_usage(self, cached_tokens):
         content = {

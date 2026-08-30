@@ -202,16 +202,15 @@ class Session:
             input_ids_unpadded += req.input_ids
         return input_ids, input_ids_unpadded
 
-    def _consume_asserted_full_prefix(
+    def _consume_exact_full_prefix(
         self, last_req: Req, req: TokenizedGenerateReqInput
     ) -> bool:
         """Convert a verified full OpenAI transcript into an append-only turn.
 
-        ``offset`` is the exact live-state length. ``input_offset`` optionally
-        points at the new suffix in a canonically re-tokenized transcript. When
-        the two differ, the entire previously committed origin must still match
-        bit-for-bit; only the immediately preceding generated output is allowed
-        to have a different canonical representation.
+        ``offset`` is the exact live-state length. The incoming prefix must be
+        bit-for-bit identical to the committed origin and raw generated output;
+        clients must rebase through the ordinary Radix cache when a parsed
+        OpenAI tool/reasoning message canonicalizes to different token IDs.
         """
         params = req.session_params
         assert params is not None
@@ -227,28 +226,18 @@ class Session:
         if committed_offset != expected_offset:
             return False
 
-        input_offset = params.input_offset or committed_offset
-        if not len(committed_origin) <= input_offset <= len(req.input_ids):
+        if committed_offset > len(req.input_ids):
             return False
-        if req.input_ids[: len(committed_origin)] != committed_origin:
-            return False
-        if (
-            params.input_offset is None
-            and req.input_ids[len(committed_origin) : input_offset]
-            != committed_output
-        ):
+        if req.input_ids[:committed_offset] != committed_origin + committed_output:
             return False
 
-        req.input_ids = req.input_ids[input_offset:]
-        req.session_params = msgspec.structs.replace(
-            params, offset=None, input_offset=None
-        )
+        req.input_ids = req.input_ids[committed_offset:]
+        req.session_params = msgspec.structs.replace(params, offset=None)
         logger.info(
-            "Streaming session %s verified full prompt: committed=%d "
-            "input_boundary=%d suffix=%d",
+            "Streaming session %s verified exact full prompt: committed=%d "
+            "suffix=%d",
             self.session_id,
             committed_offset,
-            input_offset,
             len(req.input_ids),
         )
         return True
@@ -288,7 +277,7 @@ class Session:
                 [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
                 if session_params.offset and session_params.offset != 0:
-                    if self._consume_asserted_full_prefix(last_req, req):
+                    if self._consume_exact_full_prefix(last_req, req):
                         session_params = req.session_params
                     else:
                         abort = True
@@ -300,9 +289,7 @@ class Session:
                         last_req = None
             elif session_params.offset and session_params.offset != 0:
                 abort = True
-                abort_message = (
-                    "Streaming session offset requires a committed request."
-                )
+                abort_message = "Streaming session offset requires a committed request."
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():

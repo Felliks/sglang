@@ -937,12 +937,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     "return_prompt_token_ids is not supported with streaming. "
                     "Please set stream=false when using return_prompt_token_ids=true."
                 )
-            if request.return_token_ids:
-                raise ValueError(
-                    "return_token_ids is not supported with streaming on "
-                    "/v1/chat/completions. Please set stream=false when using "
-                    "return_token_ids=true."
-                )
+            if request.return_token_ids and request.n != 1:
+                raise ValueError("Streaming return_token_ids currently requires n=1.")
             if request.return_meta_info:
                 raise ValueError(
                     "return_meta_info is not supported with streaming. "
@@ -1519,6 +1515,8 @@ class OpenAIServingChat(OpenAIServingBase):
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
+        input_ids = {}
+        output_ids = {}
 
         stream_started = False
         try:
@@ -1550,6 +1548,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
+
+                if request.return_token_ids:
+                    prompt_token_ids = content.get("prompt_token_ids")
+                    if prompt_token_ids is not None and index not in input_ids:
+                        input_ids[index] = list(prompt_token_ids)
+                    current_output_ids = list(content.get("output_ids") or ())
+                    if self.tokenizer_manager.server_args.incremental_streaming_output:
+                        output_ids.setdefault(index, []).extend(current_output_ids)
+                    else:
+                        output_ids[index] = current_output_ids
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -1675,7 +1683,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_input_ids = None
+            sglext_output_ids = None
+            if request.return_token_ids:
+                sglext_input_ids = input_ids.get(0)
+                sglext_output_ids = output_ids.get(0, [])
+
+            if (
+                sglext_routed is not None
+                or sglext_details is not None
+                or sglext_input_ids is not None
+                or sglext_output_ids is not None
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1684,6 +1703,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        input_ids=sglext_input_ids,
+                        output_ids=sglext_output_ids,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
