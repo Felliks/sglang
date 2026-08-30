@@ -109,6 +109,11 @@ class ExpertDistributionRecorder(ABC):
         yield
 
     @contextmanager
+    def speculative_draft_region(self):
+        """Keep draft routing excluded unless explicitly requested."""
+        yield
+
+    @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield {}
 
@@ -212,6 +217,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             yield
         finally:
             self._disable_all = previous_disable_all
+
+    def speculative_draft_region(self):
+        if self._server_args.expert_distribution_recorder_capture_speculative_draft:
+            return self.with_debug_name(_SINGLE_PASS_GATHERER_KEY_SPECULATIVE_DRAFT)
+        return self.disable_this_region()
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
@@ -546,21 +556,27 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             _topk_ids_of_layer=self._topk_ids_of_layer,
         )
 
+        active_layer_indices = (
+            torch.any(self._topk_ids_of_layer[:, :num_tokens, :] >= 0, dim=(1, 2))
+            .nonzero(as_tuple=False)
+            .flatten()
+        )
         output = dict(
             **self._metadata,
             topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
+            active_layer_indices=active_layer_indices.cpu().tolist(),
             misc_objects=self._misc_objects,
             global_physical_count=global_physical_count,
         )
-        if self._capture_router_inputs:
+        if self._capture_router_inputs and active_layer_indices.numel() > 0:
             output.update(
                 router_inputs_of_layer=self._router_inputs_of_layer[
-                    :, :num_router_input_tokens
+                    active_layer_indices, :num_router_input_tokens
                 ]
                 .clone()
                 .cpu(),
                 router_logits_of_layer=self._router_logits_of_layer[
-                    :, :num_router_input_tokens
+                    active_layer_indices, :num_router_input_tokens
                 ]
                 .clone()
                 .cpu(),
@@ -746,6 +762,7 @@ def _convert_local_to_global_physical_count(
 # --------------------------------------- Accumulator -----------------------------------------
 
 _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
+_SINGLE_PASS_GATHERER_KEY_SPECULATIVE_DRAFT = "speculative_draft"
 
 
 class _Accumulator(ABC):
@@ -929,9 +946,17 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._total_records = 0
 
     def get_single_pass_gatherer_keys(self):
-        return super().get_single_pass_gatherer_keys()
+        keys = super().get_single_pass_gatherer_keys()
+        if self._server_args.expert_distribution_recorder_capture_speculative_draft:
+            keys.append(_SINGLE_PASS_GATHERER_KEY_SPECULATIVE_DRAFT)
+        return keys
 
     def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
+        if (
+            debug_name == _SINGLE_PASS_GATHERER_KEY_SPECULATIVE_DRAFT
+            and self._server_args.expert_distribution_recorder_capture_speculative_draft
+        ):
+            return _SINGLE_PASS_GATHERER_KEY_SPECULATIVE_DRAFT
         return super().get_single_pass_gatherer_key(debug_name)
 
     def append(
@@ -971,13 +996,14 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         assert output_mode == "file"
         text_config = self._server_args.get_model_config().hf_text_config
         output = dict(
-            schema_version=2,
+            schema_version=3,
             trace_metadata=dict(
                 num_layers=self._expert_location_metadata.num_layers,
                 num_logical_experts=self._expert_location_metadata.num_logical_experts,
                 num_experts_per_tok=text_config.num_experts_per_tok,
                 hidden_size=text_config.hidden_size,
                 capture_router_inputs=self._server_args.expert_distribution_recorder_capture_router_inputs,
+                capture_speculative_draft=self._server_args.expert_distribution_recorder_capture_speculative_draft,
                 max_router_input_tokens_per_pass=self._server_args.expert_distribution_recorder_max_router_input_tokens_per_pass,
                 buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
                 total_records=self._total_records,

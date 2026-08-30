@@ -2420,6 +2420,11 @@ class ServerArgs:
         "Capture bounded router inputs and logits in per-token expert distribution traces.",
         NS("exec.moe"),
     ] = False
+    expert_distribution_recorder_capture_speculative_draft: A[
+        bool,
+        "Record speculative-draft MoE routing in a separate per-token trace scope.",
+        NS("exec.moe"),
+    ] = False
     expert_distribution_recorder_max_router_input_tokens_per_pass: A[
         int,
         "Maximum number of trailing router-input tokens captured per forward pass.",
@@ -7283,6 +7288,12 @@ class ServerArgs:
                 raise ValueError(
                     "--expert-distribution-recorder-max-router-input-tokens-per-pass "
                     "must be at least 1"
+                )
+        if self.expert_distribution_recorder_capture_speculative_draft:
+            if self.expert_distribution_recorder_mode != "per_token":
+                raise ValueError(
+                    "--expert-distribution-recorder-capture-speculative-draft "
+                    "requires --expert-distribution-recorder-mode per_token"
                 )
 
     def _handle_pipeline_parallelism(self):
