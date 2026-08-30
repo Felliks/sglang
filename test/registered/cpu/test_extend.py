@@ -1,13 +1,12 @@
 import unittest
 
-import sgl_kernel  # noqa: F401
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 torch.manual_seed(1234)
 
@@ -197,8 +196,6 @@ class TestExtendAttention(CustomTestCase):
         *,
         b_seq_len_prefix=None,
         b_seq_len_extend=None,
-        kv_from_cache=False,
-        is_causal=True,
     ):
         dtype = torch.bfloat16
 
@@ -317,7 +314,7 @@ class TestExtendAttention(CustomTestCase):
                 b_seq_len_extend,
                 scaling=sm_scale,
                 enable_gqa=enable_gqa,
-                causal=(not is_cross_attn) and is_causal,
+                causal=not is_cross_attn,
                 is_cross_attn=is_cross_attn,
                 encoder_lens=encoder_lens,
             )
@@ -325,8 +322,8 @@ class TestExtendAttention(CustomTestCase):
         o_extend = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
         torch.ops.sgl_kernel.extend_attention_cpu(
             q_extend,
-            None if kv_from_cache else k_extend,
-            None if kv_from_cache else v_extend,
+            k_extend,
+            v_extend,
             o_extend,
             k_buffer,
             v_buffer,
@@ -342,8 +339,6 @@ class TestExtendAttention(CustomTestCase):
             sliding_window if sliding_window is not None else 0,
             encoder_lens,
             sinks if has_sink else None,
-            None,  # tree_mask
-            is_causal,
         )
 
         torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
@@ -379,27 +374,6 @@ class TestExtendAttention(CustomTestCase):
                     1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False
                 )
 
-    def test_extend_attention_kv_from_cache(self):
-        # KV-shared layers pass no extend K/V, so the kernel masks the extend
-        # range causally itself; sizes straddle several BLOCK_N.
-        # Window only tested with a sink - _run_sdpa_forward_extend models none,
-        # the same restriction test_extend_attention applies.
-        for sliding_window, has_sink in [(None, False), (128, True)]:
-            for prefix, extend in [([0], [343]), ([100], [343]), ([0], [1500])]:
-                self._test_extend_attention_once(
-                    B=1,
-                    N_CTX=4096,
-                    H_Q=16,
-                    H_KV=4,
-                    D=64,
-                    DV=64,
-                    sliding_window=sliding_window,
-                    has_sink=has_sink,
-                    b_seq_len_prefix=prefix,
-                    b_seq_len_extend=extend,
-                    kv_from_cache=True,
-                )
-
     def test_extend_attention_large_seq_causal_mask(self):
         self._test_extend_attention_once(
             B=1,
@@ -422,20 +396,6 @@ class TestExtendAttention(CustomTestCase):
             DV=96,
             b_seq_len_prefix=[97],
             b_seq_len_extend=[37],
-        )
-
-    def test_extend_attention_bidirectional(self):
-        # Test for is_causal=False: encoder-only self-attention (e.g. bge-reranker)
-        self._test_extend_attention_once(
-            B=4,
-            N_CTX=123,
-            H_Q=16,
-            H_KV=4,
-            D=128,
-            DV=96,
-            b_seq_len_prefix=[0, 0, 0, 0],
-            b_seq_len_extend=[41, 90, 123, 5],
-            is_causal=False,
         )
 
 

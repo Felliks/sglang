@@ -9,7 +9,7 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.server_args import ServerArgs
 
 
 class LinearAttnKernelBackend(Enum):
@@ -21,7 +21,6 @@ class LinearAttnKernelBackend(Enum):
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
     HELION = "helion"
-    INTEL_XPU = "intel_xpu"
     CUSTOM = "custom"
 
     @classmethod
@@ -51,9 +50,6 @@ class LinearAttnKernelBackend(Enum):
 
     def is_helion(self):
         return self == LinearAttnKernelBackend.HELION
-
-    def is_intel_xpu(self):
-        return self == LinearAttnKernelBackend.INTEL_XPU
 
     def is_custom(self):
         return self == LinearAttnKernelBackend.CUSTOM
@@ -103,7 +99,9 @@ def resolve_linear_attn_backends(
     return backends
 
 
-def build_verify_intermediate_state_indices(pool_size: int, device):
+def build_verify_intermediate_state_indices(
+    pool_size: int, server_args: ServerArgs, device
+):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
     target_verify path: request slot i owns scratch row i.
@@ -121,7 +119,7 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
 
     from sglang.srt.utils.common import get_eager_max_batch_size
 
-    padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
+    padded_bs = max(get_eager_max_batch_size(server_args, pool_size), pool_size)
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import torch
 
@@ -443,42 +444,27 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             f"NVFP4 Marlin MoE requires group_size=16, got {layer.quant_config.group_size}."
         )
 
-    w13 = layer.w13_weight.data
-    w2 = layer.w2_weight.data
-    w13_scale = layer.w13_weight_scale.data
-    w2_scale = layer.w2_weight_scale.data
-    w13_global_scale = layer.w13_weight_scale_2.data
-    w2_global_scale = layer.w2_weight_scale_2.data
-    w13_bias = getattr(layer, "w13_bias", None)
-    w2_bias = getattr(layer, "w2_bias", None)
+    # GX10 nightlab patch: Qwen3.8-Flash-Next is gated.  Keep the patch narrow
+    # and fail closed for unvalidated non-gated layouts instead of silently
+    # changing their padding semantics.
+    if not layer.moe_runner_config.is_gated:
+        raise RuntimeError("low-peak NVFP4 Marlin repack is validated for gated MoE only")
 
-    num_experts = w13.shape[0]
+    num_experts = layer.w13_weight.shape[0]
     num_shards = 2 if layer.moe_runner_config.is_gated else 1
     intermediate_size = layer.intermediate_size_per_partition
-    hidden_size = w13.shape[2] * 2
+    hidden_size = layer.w13_weight.shape[2] * 2
     param_dtype = layer.params_dtype
     if param_dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError("NVFP4 Marlin MoE requires FP16 or BF16 activations.")
 
-    device = w13.device
+    device = layer.w13_weight.device
+    layer_id = getattr(layer, "layer_id", getattr(layer, "prefix", "unknown"))
+    repack_started = time.perf_counter()
+    allocated_before = torch.cuda.memory_allocated(device)
+    reserved_before = torch.cuda.memory_reserved(device)
     layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
-
-    if not layer.moe_runner_config.is_gated:
-        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
-        intermediate_size_pad = padded_intermediate_size - intermediate_size
-        if intermediate_size_pad:
-            w13 = torch.nn.functional.pad(w13, (0, 0, 0, intermediate_size_pad))
-            w13_scale = torch.nn.functional.pad(
-                w13_scale, (0, 0, 0, intermediate_size_pad)
-            )
-            w2 = torch.nn.functional.pad(w2, (0, intermediate_size_pad // 2, 0, 0))
-            w2_scale = torch.nn.functional.pad(
-                w2_scale, (0, intermediate_size_pad // 16)
-            )
-            if w13_bias is not None:
-                w13_bias = torch.nn.functional.pad(w13_bias, (0, intermediate_size_pad))
-            intermediate_size = padded_intermediate_size
 
     def _repack_weight(weight: torch.Tensor, is_w13: bool) -> torch.Tensor:
         if is_w13:
@@ -487,69 +473,132 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             size_n, size_k = hidden_size, intermediate_size
         assert weight.shape == (num_experts, size_n, size_k // 2)
 
-        tensor_list = []
+        output_shape = None
         for i in range(num_experts):
-            qweight = weight[i].view(torch.int32).T.contiguous()
-            marlin_qweight = gptq_marlin_repack(
-                b_q_weight=qweight,
+            output = gptq_marlin_repack(
+                b_q_weight=weight[i].view(torch.int32).T.contiguous(),
                 perm=perm,
                 size_k=size_k,
                 size_n=size_n,
                 num_bits=4,
             )
-            tensor_list.append(marlin_qweight)
-        return torch.stack(tensor_list)
+            output_shape = output.shape
+            destination = weight[i].view(torch.uint8).reshape(-1)
+            source = output.view(torch.uint8).reshape(-1)
+            if destination.numel() != source.numel():
+                raise RuntimeError("Marlin weight repack is not byte-size preserving")
+            destination.copy_(source)
+            del destination, source, output
+        assert output_shape is not None
+        return weight.view(torch.int32).reshape(num_experts, *output_shape)
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
-        scales = scales.to(param_dtype)
         if is_w13:
             size_n, size_k = intermediate_size * num_shards, hidden_size
         else:
             size_n, size_k = hidden_size, intermediate_size
 
-        tensor_list = []
-        for i in range(num_experts):
-            scale = scales[i].T.contiguous()
+        def _one(i: int) -> torch.Tensor:
+            scale = scales[i].to(param_dtype).T.contiguous()
             marlin_scales = marlin_permute_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
                 group_size=16,
             )
-            tensor_list.append(nvfp4_marlin_process_scales(marlin_scales))
-        return torch.stack(tensor_list)
+            return nvfp4_marlin_process_scales(marlin_scales)
+
+        output_shape = None
+        output_dtype = None
+        for i in range(num_experts):
+            output = _one(i)
+            output_shape = output.shape
+            output_dtype = output.dtype
+            destination = scales[i].view(torch.uint8).reshape(-1)
+            source = output.view(torch.uint8).reshape(-1)
+            if destination.numel() != source.numel():
+                raise RuntimeError("Marlin scale repack is not byte-size preserving")
+            destination.copy_(source)
+            del destination, source, output
+        assert output_shape is not None and output_dtype is not None
+        return scales.view(output_dtype).reshape(num_experts, *output_shape)
 
     def _process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
         return nvfp4_marlin_process_global_scale(global_scale.to(param_dtype))
 
-    def _permute_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
-        if bias is None:
-            return None
-        tensor_list = []
-        for i in range(num_experts):
-            tensor_list.append(marlin_permute_bias(bias[i].to(param_dtype)))
-        return torch.stack(tensor_list)
+    def _release_cache() -> None:
+        # CUDA allocations share the GX10 physical UMA pool.  Return dead,
+        # differently-shaped blocks before materializing the next tensor.
+        torch.cuda.empty_cache()
 
+    raw = layer.w13_weight.data
     layer.w13_weight = torch.nn.Parameter(
-        _repack_weight(w13, True), requires_grad=False
+        _repack_weight(raw, True), requires_grad=False
     )
-    layer.w2_weight = torch.nn.Parameter(_repack_weight(w2, False), requires_grad=False)
-    layer.w13_weight_scale = torch.nn.Parameter(
-        _permute_scales(w13_scale, True), requires_grad=False
-    )
-    layer.w2_weight_scale = torch.nn.Parameter(
-        _permute_scales(w2_scale, False), requires_grad=False
-    )
-    layer.w13_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w13_global_scale), requires_grad=False
-    )
-    layer.w2_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w2_global_scale), requires_grad=False
-    )
+    del raw
+    _release_cache()
 
-    if w13_bias is not None:
-        layer.w13_bias = torch.nn.Parameter(
-            _permute_bias(w13_bias), requires_grad=False
+    raw = layer.w13_weight_scale.data
+    layer.w13_weight_scale = torch.nn.Parameter(
+        _permute_scales(raw, True), requires_grad=False
+    )
+    del raw
+    _release_cache()
+
+    raw = layer.w2_weight.data
+    layer.w2_weight = torch.nn.Parameter(
+        _repack_weight(raw, False), requires_grad=False
+    )
+    del raw
+    _release_cache()
+
+    raw = layer.w2_weight_scale.data
+    layer.w2_weight_scale = torch.nn.Parameter(
+        _permute_scales(raw, False), requires_grad=False
+    )
+    del raw
+    _release_cache()
+
+    raw = layer.w13_weight_scale_2.data
+    layer.w13_weight_scale_2 = torch.nn.Parameter(
+        _process_global_scale(raw), requires_grad=False
+    )
+    del raw
+
+    raw = layer.w2_weight_scale_2.data
+    layer.w2_weight_scale_2 = torch.nn.Parameter(
+        _process_global_scale(raw), requires_grad=False
+    )
+    del raw
+
+    for name in ("w13_bias", "w2_bias"):
+        bias = getattr(layer, name, None)
+        if bias is None:
+            continue
+        raw = bias.data
+        first = marlin_permute_bias(raw[0].to(param_dtype))
+        output = torch.empty(
+            (num_experts, *first.shape), dtype=first.dtype, device=device
         )
-    if w2_bias is not None:
-        layer.w2_bias = torch.nn.Parameter(_permute_bias(w2_bias), requires_grad=False)
+        output[0].copy_(first)
+        del first
+        for i in range(1, num_experts):
+            output[i].copy_(marlin_permute_bias(raw[i].to(param_dtype)))
+        setattr(layer, name, torch.nn.Parameter(output, requires_grad=False))
+        del raw, output
+        _release_cache()
+
+    torch.cuda.synchronize(device)
+    _release_cache()
+    logger.info(
+        "nightlab inplace NVFP4 Marlin repack layer=%s experts=%d "
+        "elapsed=%.3fs allocated_before_mib=%.1f allocated_after_mib=%.1f "
+        "reserved_before_mib=%.1f reserved_after_mib=%.1f",
+        layer_id,
+        num_experts,
+        time.perf_counter() - repack_started,
+        allocated_before / 2**20,
+        torch.cuda.memory_allocated(device) / 2**20,
+        reserved_before / 2**20,
+        torch.cuda.memory_reserved(device) / 2**20,
+    )

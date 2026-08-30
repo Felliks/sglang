@@ -14,7 +14,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-20ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1.5k | 16ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-16ms) |
 | DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
 | DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
 | DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
@@ -97,9 +97,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=4000
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=3500
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -112,12 +112,12 @@ do
         --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
-        --mem-fraction-static 0.8 \
+        --mem-fraction-static 0.62 \
         --quantization modelslim \
         --max-running-requests 32 \
         --context-length 8192 \
         --disable-radix-cache \
-        --chunked-prefill-size 20480 \
+        --chunked-prefill-size -1 \
         --max-prefill-tokens 20480 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
@@ -131,11 +131,11 @@ do
         --dtype bfloat16 \
         --reasoning-parser deepseek-r1 \
         --tool-call-parser deepseekv3 \
-        --max-total-tokens 80000 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -146,12 +146,11 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=800
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export TASK_QUEUE_ENABLE=1
 
         python3 -m sglang.launch_server \
@@ -162,7 +161,7 @@ do
         --nnodes 1 \
         --tp-size 16 \
         --dp-size 16 \
-        --mem-fraction-static 0.9 \
+        --mem-fraction-static 0.805 \
         --max-running-requests 416 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
@@ -183,11 +182,11 @@ do
         --load-balance-method round_robin \
         --reasoning-parser deepseek-r1 \
         --tool-call-parser deepseekv3 \
-        --max-total-tokens 145792 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -219,13 +218,12 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --request-rate 24 \
     --max-concurrency 416 \
-    --num-prompts 1664 \
     --random-input-len 3584 \
     --random-output-len 1536 \
+    --num-prompts 1664 \
     --random-range-ratio 1 \
-    --seed 1
+    --request-rate 24
 ```
 
 <a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
@@ -271,16 +269,15 @@ unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
-export DEEPEP_HCCL_BUFFSIZE=2000
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=1200
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=56
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
@@ -297,11 +294,11 @@ python3 -m sglang.launch_server \
     --quantization modelslim \
     --watchdog-timeout 9000 \
     --cuda-graph-bs 4 8 12 14 \
-    --mem-fraction-static 0.9 \
+    --mem-fraction-static 0.77 \
     --max-running-requests 224 \
     --context-length 8188 \
     --disable-radix-cache \
-    --chunked-prefill-size 65536 \
+    --chunked-prefill-size -1 \
     --max-prefill-tokens 3000 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
@@ -314,8 +311,7 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 4 \
     --dtype bfloat16 \
     --reasoning-parser deepseek-r1 \
-    --tool-call-parser deepseekv3 \
-    --max-total-tokens 100000
+    --tool-call-parser deepseekv3
 ```
 
 #### Benchmark
@@ -329,16 +325,15 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 224 \
-    --num-prompts 896 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --random-range-ratio 1 \
-    --seed 1
+    --num-prompts 896 \
+    --random-range-ratio 1
 ```
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 20ms
+### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 16ms
 
 **Model**: DeepSeek-R1
 
@@ -352,7 +347,7 @@ python -m sglang.bench_serving \
 
 **Dataset**: 3.5k+1.5k
 
-**TPOT**: 20ms
+**TPOT**: 16ms
 
 #### Model Deployment
 
@@ -405,9 +400,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1536
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -444,6 +439,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -454,12 +450,11 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=650
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=650
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -499,6 +494,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -533,13 +529,12 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --request-rate 16 \
     --max-concurrency 32 \
-    --num-prompts 32 \
     --random-input-len 3500 \
     --random-output-len 1500 \
+    --num-prompts 32 \
     --random-range-ratio 1 \
-    --seed 42
+    --request-rate 16
 ```
 
 ### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 50ms
@@ -611,12 +606,11 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=800
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
-        export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_USE_AG_AFTER_QLORA=1
         export TASK_QUEUE_ENABLE=2
 
@@ -630,13 +624,12 @@ do
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.778 \
-        --quantization modelslim \
         --max-running-requests 16 \
         --disable-radix-cache \
         --chunked-prefill-size -1 \
         --max-prefill-tokens 60000 \
         --moe-a2a-backend ascend_fuseep \
-        --deepep-mode normal \
+        --fuseep-mode 2 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
@@ -652,6 +645,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -662,14 +656,12 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=600
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=600
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_LM_HEAD_TP=8
-        export SGLANG_NPU_FUSED_MOE_MODE=1
         export TASK_QUEUE_ENABLE=1
 
         python3 -m sglang.launch_server \
@@ -684,8 +676,8 @@ do
         --dp-size 32 \
         --mem-fraction-static 0.82 \
         --max-running-requests 1024 \
-        --quantization modelslim \
         --moe-a2a-backend ascend_fuseep \
+        --fuseep-mode 1 \
         --enable-dp-attention \
         --deepep-mode low_latency \
         --moe-dense-tp 1 \
@@ -707,6 +699,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -741,13 +734,12 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --request-rate 40 \
     --max-concurrency 1024 \
-    --num-prompts 7168 \
     --random-input-len 3584 \
     --random-output-len 1536 \
+    --num-prompts 7168 \
     --random-range-ratio 1 \
-    --seed 1
+    --request-rate 40
 ```
 
 ### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K 19.0ms
@@ -817,9 +809,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1536
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -856,6 +848,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -866,12 +859,11 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=650
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=650
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -911,6 +903,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -945,13 +938,12 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --request-rate 16 \
     --max-concurrency 32 \
-    --num-prompts 32 \
     --random-input-len 3500 \
     --random-output-len 1024 \
+    --num-prompts 32 \
     --random-range-ratio 1 \
-    --seed 1
+    --request-rate 16
 ```
 
 ### DeepSeek-R1 W8A8 2P1D 32P IN3K9 OUT1K 19.0ms
@@ -1021,9 +1013,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1536
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -1060,6 +1052,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -1070,12 +1063,11 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=650
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=650
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1115,6 +1107,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -1149,13 +1142,12 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --request-rate 16 \
     --max-concurrency 32 \
-    --num-prompts 32 \
     --random-input-len 3900 \
     --random-output-len 1024 \
+    --num-prompts 32 \
     --random-range-ratio 1 \
-    --seed 1
+    --request-rate 16
 ```
 
 ### DeepSeek-R1 W8A8 2P1D 32P IN6K OUT1K6 20.5ms
@@ -1225,9 +1217,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1536
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=1536
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -1263,6 +1255,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -1273,12 +1266,11 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=650
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=650
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1317,6 +1309,7 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
+        NODE_RANK=$i
         break
     fi
 done
@@ -1351,11 +1344,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --request-rate 16 \
     --max-concurrency 32 \
-    --num-prompts 32 \
     --random-input-len 6000 \
     --random-output-len 1600 \
+    --num-prompts 32 \
     --random-range-ratio 1 \
-    --seed 1
+    --request-rate 16
 ```

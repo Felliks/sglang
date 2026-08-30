@@ -22,11 +22,9 @@ class _FakeAllocator:
 
 class _FakeReq:
     req_pool_idx = 0
-
-    def __init__(self):
-        self.kv = SimpleNamespace(
-            swa_evicted_seqlen=6, swa_evict_floor=3, cache_protected_len=0
-        )
+    swa_evict_floor = 3
+    cache_protected_len = 0
+    kv = SimpleNamespace(swa_evicted_seqlen=6)
 
     def pop_committed_kv_cache(self):
         return 8
@@ -53,7 +51,7 @@ class TestPureSWAChunkCache(CustomTestCase):
     def test_finished_req_skips_protected_prefix(self):
         cache = self._make_cache()
         req = _FakeReq()
-        req.kv.cache_protected_len = 2
+        req.cache_protected_len = 2
 
         cache.cache_finished_req(req, kv_len_to_handle=8)
 

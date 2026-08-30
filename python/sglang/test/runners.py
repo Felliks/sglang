@@ -424,25 +424,16 @@ class HFRunner:
                         f"before producing output"
                     )
 
-    def _stop_model_proc(self):
-        # Fire-and-forget terminate() leaves the child holding the accelerator
-        # during teardown; a follow-on SRTRunner on the same device can then
-        # deadlock in driver init (observed on Intel XPU B580).
-        self.model_proc.terminate()
-        self.model_proc.join(timeout=30)
-        if self.model_proc.is_alive():
-            self.model_proc.kill()
-            self.model_proc.join()
-        self.in_queue = self.out_queue = None
-
     def terminate(self):
-        self._stop_model_proc()
+        self.model_proc.terminate()
+        self.in_queue = self.out_queue = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self._stop_model_proc()
+        self.model_proc.terminate()
+        self.in_queue = self.out_queue = None
 
     @staticmethod
     def forward_generation_raw(

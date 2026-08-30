@@ -71,7 +71,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         )
         plan = resolved_embedding_plan(
             spec,
-            config=SimpleNamespace(
+            server_args=SimpleNamespace(
                 is_embedding=True,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(

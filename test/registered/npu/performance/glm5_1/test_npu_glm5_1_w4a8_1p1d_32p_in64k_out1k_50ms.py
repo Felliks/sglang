@@ -70,7 +70,7 @@ GLM_5_1_PD_SEP_PREFILL_ARGS = [
     "--served-model-name",
     "glm-5",
     "--chunked-prefill-size",
-    32768,
+    16384,
     "--max-prefill-tokens",
     180000,
     "--moe-a2a-backend",
@@ -151,14 +151,6 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     "glm45",
     "--tool-call-parser",
     "glm47",
-    "--speculative-algorithm",
-    "NEXTN",
-    "--speculative-num-steps",
-    3,
-    "--speculative-eagle-topk",
-    1,
-    "--speculative-num-draft-tokens",
-    4,
 ]
 
 GLM_5_1_PD_SEP_MODEL_CONFIG = {
@@ -179,8 +171,8 @@ class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBa
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     dataset_name = "random"
-    max_concurrency = 32
-    num_prompts = 64
+    max_concurrency = 1
+    num_prompts = 1
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1

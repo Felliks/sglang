@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import torch
 
-from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -21,6 +20,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
+from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

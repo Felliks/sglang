@@ -409,18 +409,7 @@ class TestKDAPackedDecode(unittest.TestCase):
 
     @staticmethod
     def _run_baseline(
-        mixed_qkv,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        ssm_states,
-        cache_indices,
-        H,
-        HV,
-        K,
-        V,
-        lower_bound=None,
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, H, HV, K, V
     ):
         B = mixed_qkv.shape[0]
         q_flat, k_flat, v_flat = torch.split(mixed_qkv, [H * K, H * K, HV * V], dim=-1)
@@ -447,22 +436,11 @@ class TestKDAPackedDecode(unittest.TestCase):
             scale=K**-0.5,
             use_qk_l2norm_in_kernel=True,
             is_kda=True,
-            lower_bound=lower_bound,
         )
 
     @staticmethod
     def _run_packed(
-        mixed_qkv,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        ssm_states,
-        cache_indices,
-        HV,
-        K,
-        V,
-        lower_bound=None,
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, HV, K, V
     ):
         B = mixed_qkv.shape[0]
         out = mixed_qkv.new_empty(B, 1, HV, V)
@@ -477,11 +455,10 @@ class TestKDAPackedDecode(unittest.TestCase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
-            lower_bound=lower_bound,
         )
         return out.transpose(0, 1)
 
-    def _check(self, B, H, HV, K, V, lower_bound=None):
+    def _check(self, B, H, HV, K, V):
         device = get_device()
         dtype = torch.bfloat16
         pool_size = B + 4
@@ -492,31 +469,10 @@ class TestKDAPackedDecode(unittest.TestCase):
         s_baseline = ssm_states.clone()
 
         o_packed = self._run_packed(
-            mixed_qkv,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            s_packed,
-            cache_indices,
-            HV,
-            K,
-            V,
-            lower_bound=lower_bound,
+            mixed_qkv, a, b, A_log, dt_bias, s_packed, cache_indices, HV, K, V
         )
         o_baseline = self._run_baseline(
-            mixed_qkv,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            s_baseline,
-            cache_indices,
-            H,
-            HV,
-            K,
-            V,
-            lower_bound=lower_bound,
+            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
         )
 
         torch.testing.assert_close(
@@ -544,9 +500,6 @@ class TestKDAPackedDecode(unittest.TestCase):
     def test_asymmetric_heads(self):
         # Common KDA config with HV > H (grouped query).
         self._check(B=8, H=8, HV=16, K=128, V=128)
-
-    def test_safe_gate_lower_bound(self):
-        self._check(B=8, H=16, HV=16, K=128, V=128, lower_bound=-5.0)
 
     def test_pad_slot(self):
         """Entries with state_idx == -1 must produce zero output and skip state writeback."""
@@ -591,7 +544,6 @@ class TestKDAPackedDecode(unittest.TestCase):
         device = get_device()
         dtype = torch.bfloat16
         B, H, HV, K, V = 4, 16, 16, 128, 128
-        lower_bound = -5.0
         pool_size = B + 4
         mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
             B, H, HV, K, V, pool_size, dtype, device
@@ -616,23 +568,11 @@ class TestKDAPackedDecode(unittest.TestCase):
             cache_indices=cache_indices,
             num_v_heads=HV,
             head_v_dim=V,
-            lower_bound=lower_bound,
         )
 
         s_baseline = ssm_states.clone()
         o_baseline = self._run_baseline(
-            mixed_qkv,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            s_baseline,
-            cache_indices,
-            H,
-            HV,
-            K,
-            V,
-            lower_bound=lower_bound,
+            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
         )
 
         # Dispatcher returns [1, B, HV, V], same layout as the baseline.

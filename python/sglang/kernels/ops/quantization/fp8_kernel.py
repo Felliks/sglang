@@ -35,7 +35,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -45,7 +44,6 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
-_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -56,8 +54,6 @@ if _is_cuda:
     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
-elif _is_xpu:
-    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
 if _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8

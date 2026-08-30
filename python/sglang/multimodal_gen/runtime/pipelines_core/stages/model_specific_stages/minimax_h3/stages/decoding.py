@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping
-from contextlib import contextmanager, nullcontext
 
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
-    get_replica_group,
+    get_world_group,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -29,8 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import (
-    autocast_context,
-    autocast_enabled_for_device,
+    autocast_enabled,
     resolve_decode_precision,
     resolve_precision,
 )
@@ -43,39 +41,6 @@ def _required_tensor(value, path: str) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise ValueError(f"{path} must be a torch.Tensor")
     return value
-
-
-@contextmanager
-def _deterministic_audio_decode_context():
-    """Deterministic-algorithm scope for the fp32 audio-VAE decode.
-
-    Without it, cuDNN picks conv algorithms from free-workspace state, so the
-    same audio latent decodes to different bytes on a server process's first
-    request than on every later one. Deterministic algorithms with TF32 off
-    keep cuDNN speed (unlike the encode-side context, which disables cuDNN);
-    if first-request divergence ever reappears, escalate to
-    reference_encoding._AudioVAEDeterminismContext.
-    """
-    b = torch.backends
-    saved = (
-        b.cudnn.allow_tf32,
-        b.cuda.matmul.allow_tf32,
-        b.cudnn.deterministic,
-        b.cudnn.benchmark,
-    )
-    b.cudnn.allow_tf32 = False
-    b.cuda.matmul.allow_tf32 = False
-    b.cudnn.deterministic = True
-    b.cudnn.benchmark = False
-    try:
-        yield
-    finally:
-        (
-            b.cudnn.allow_tf32,
-            b.cuda.matmul.allow_tf32,
-            b.cudnn.deterministic,
-            b.cudnn.benchmark,
-        ) = saved
 
 
 @functools.lru_cache(maxsize=None)
@@ -327,19 +292,15 @@ class MiniMaxH3DecodingStage(DecodingStage):
             audio_vae_dtype = resolve_precision(
                 server_args, "audio_vae", precision_attr="audio_vae_precision"
             )
-            audio_autocast_enabled = autocast_enabled_for_device(
-                audio_latent, audio_vae_dtype, server_args.disable_autocast
+            audio_autocast_enabled = (
+                audio_latent.device.type == "cuda"
+                and autocast_enabled(audio_vae_dtype, server_args.disable_autocast)
             )
-            autocast_context = (
-                torch.autocast(
-                    device_type="cuda",
-                    dtype=audio_vae_dtype,
-                    enabled=audio_autocast_enabled,
-                )
-                if audio_latent.is_cuda
-                else nullcontext()
-            )
-            with _deterministic_audio_decode_context(), autocast_context:
+            with torch.autocast(
+                device_type=audio_latent.device.type,
+                dtype=audio_vae_dtype,
+                enabled=audio_autocast_enabled,
+            ):
                 audio_decode = self._get_vae_decode_fn(
                     audio_vae,
                     server_args,
@@ -385,14 +346,15 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 name="video_vae",
             )
             video_vae_dtype = resolve_decode_precision(server_args, "video_vae")
-            visual_autocast_enabled = autocast_enabled_for_device(
-                visual_latent, video_vae_dtype, server_args.disable_autocast
+            visual_autocast_enabled = (
+                visual_latent.device.type == "cuda"
+                and autocast_enabled(video_vae_dtype, server_args.disable_autocast)
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
-            with autocast_context(
-                video_vae_dtype,
-                server_args.disable_autocast,
+            with torch.autocast(
+                device_type=visual_latent.device.type,
+                dtype=video_vae_dtype,
                 enabled=visual_autocast_enabled,
             ):
                 video_decode = self._get_vae_decode_fn(
@@ -425,10 +387,12 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     canonical_frames.copy_(visual_frames)
                     visual_frames = canonical_frames
 
-        # Audio VAE weights are replicated. Decode on replica rank 0 and broadcast
-        # only within the request's replica, excluding independent DP replicas.
-        replica_group = get_replica_group() if model_parallel_is_initialized() else None
-        is_audio_owner = replica_group is None or replica_group.rank_in_group == 0
+        # DP is currently rejected by ServerArgs validation, so the world group
+        # is one request replica (TP/CFG/SP ranks), not a collection of
+        # independent requests. Decode the non-sharded audio VAE once per
+        # request and distribute its output to the ranks that decoded video.
+        world_group = get_world_group() if model_parallel_is_initialized() else None
+        is_audio_owner = world_group is None or world_group.rank_in_group == 0
         owner_exception = None
         owner_error = None
         audio_payload = None
@@ -438,16 +402,16 @@ class MiniMaxH3DecodingStage(DecodingStage):
             except Exception as exc:
                 owner_exception = exc
                 owner_error = f"{type(exc).__name__}: {exc}"
-        if replica_group is not None:
-            owner_error = replica_group.broadcast_object(owner_error, src=0)
+        if world_group is not None:
+            owner_error = world_group.broadcast_object(owner_error, src=0)
         if owner_error is not None:
             if owner_exception is not None:
                 raise owner_exception
             raise RuntimeError(
                 f"MiniMax H3 audio decode failed on rank 0: {owner_error}"
             )
-        if replica_group is not None:
-            audio_payload = replica_group.broadcast_tensor_dict(audio_payload, src=0)
+        if world_group is not None:
+            audio_payload = world_group.broadcast_tensor_dict(audio_payload, src=0)
         if not isinstance(audio_payload, dict):
             raise RuntimeError("MiniMax H3 audio decode produced no output payload")
         audio_waveform = _required_tensor(

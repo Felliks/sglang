@@ -79,7 +79,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
 

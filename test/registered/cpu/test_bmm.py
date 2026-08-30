@@ -2,7 +2,6 @@ import itertools
 import unittest
 
 # TODO: use interface in cpu.py
-import sgl_kernel  # noqa: F401
 import torch
 import torch.nn as nn
 
@@ -11,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=13, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 torch.manual_seed(1234)
 

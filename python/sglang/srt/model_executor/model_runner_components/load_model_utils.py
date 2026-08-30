@@ -25,11 +25,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_model,
-    get_observability,
-)
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
@@ -67,7 +62,9 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     startup_weight_load: Optional[Any] = None
 
 
-def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
+def maybe_downgrade_dtype_for_legacy_gpu(
+    *, server_args: ServerArgs, model_config: ModelConfig
+) -> None:
     if torch.cuda.get_device_capability()[0] < 8:
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
@@ -83,39 +80,43 @@ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, tp_rank: int, load_format: Optional[str] = None
+    *, server_args: ServerArgs, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
     """``load_format`` is this runner's effective format: a draft loading under
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
     target's format cannot answer for it."""
     if (
-        load_format or get_model().load_format
-    ) == LoadFormat.REMOTE_INSTANCE and get_model().remote_instance_weight_loader_backend == RemoteInstanceWeightLoaderBackend.NCCL:
+        (load_format or server_args.load_format) == LoadFormat.REMOTE_INSTANCE
+        and server_args.remote_instance_weight_loader_backend
+        == RemoteInstanceWeightLoaderBackend.NCCL
+    ):
         if tp_rank == 0:
             instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
                 target=trigger_init_weights_send_group_for_remote_instance_request,
                 args=(
-                    get_model().remote_instance_weight_loader_seed_instance_ip,
-                    get_model().remote_instance_weight_loader_seed_instance_service_port,
-                    get_model().remote_instance_weight_loader_send_weights_group_ports,
+                    server_args.remote_instance_weight_loader_seed_instance_ip,
+                    server_args.remote_instance_weight_loader_seed_instance_service_port,
+                    server_args.remote_instance_weight_loader_send_weights_group_ports,
                     instance_ip,
                 ),
             )
             t.start()
 
 
-def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
+def load_kv_cache_scales(
+    *, model, server_args: ServerArgs, kv_cache_dtype: str
+) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
     if kv_cache_dtype == "fp8_e4m3":
-        if get_model().quantization_param_path is not None:
+        if server_args.quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
-                model.load_kv_cache_scales(get_model().quantization_param_path)
+                model.load_kv_cache_scales(server_args.quantization_param_path)
                 logger.info(
                     "Loaded KV cache scaling factors from %s",
-                    get_model().quantization_param_path,
+                    server_args.quantization_param_path,
                 )
             else:
                 raise RuntimeError(
@@ -147,40 +148,41 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[in
     return sliding_window_size
 
 
-def report_online_quantization(*, model) -> None:
+def report_online_quantization(*, model, server_args: ServerArgs) -> None:
     # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
     quantized_layers = getattr(
         getattr(model, "quant_config", None), "quantized_layers", None
     )
     if (
-        get_model().quantization is not None
+        server_args.quantization is not None
         and isinstance(quantized_layers, tuple)
         and len(quantized_layers) == 2
     ):
         layer_types, quantized_layers_count = quantized_layers
         logger.info(
-            f"Online {get_model().quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
+            f"Online {server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
         )
 
 
 def maybe_register_debug_tensor_dump_hook(
     *,
     model,
+    server_args: ServerArgs,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
     tp_size: int,
     tp_rank: int,
     pp_rank: int,
 ) -> None:
-    if get_observability().debug_tensor_dump_output_folder is not None:
-        dump_folder = get_observability().debug_tensor_dump_output_folder
+    if server_args.debug_tensor_dump_output_folder is not None:
+        dump_folder = server_args.debug_tensor_dump_output_folder
         if spec_algorithm.is_eagle():
             role = "draft" if is_draft_worker else "target"
             dump_folder = os.path.join(dump_folder, role)
         register_forward_hook_for_model(
             model,
             dump_folder,
-            get_observability().debug_tensor_dump_layers,
+            server_args.debug_tensor_dump_layers,
             tp_size,
             tp_rank,
             pp_rank,
@@ -201,28 +203,28 @@ def build_load_config(
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
     modelopt_config = ModelOptConfig(
-        quant=get_model().modelopt_quant,
-        checkpoint_restore_path=get_model().modelopt_checkpoint_restore_path,
-        checkpoint_save_path=get_model().modelopt_checkpoint_save_path,
-        export_path=get_model().modelopt_export_path,
-        quantize_and_serve=get_model().quantize_and_serve,
+        quant=server_args.modelopt_quant,
+        checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
+        checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
+        export_path=server_args.modelopt_export_path,
+        quantize_and_serve=server_args.quantize_and_serve,
     )
 
     return LoadConfig(
-        load_format=load_format or get_model().load_format,
-        download_dir=get_model().download_dir,
-        model_loader_extra_config=get_model().model_loader_extra_config,
+        load_format=load_format or server_args.load_format,
+        download_dir=server_args.download_dir,
+        model_loader_extra_config=server_args.model_loader_extra_config,
         tp_rank=tp_rank,
-        remote_instance_weight_loader_seed_instance_ip=get_model().remote_instance_weight_loader_seed_instance_ip,
-        remote_instance_weight_loader_seed_instance_service_port=get_model().remote_instance_weight_loader_seed_instance_service_port,
-        remote_instance_weight_loader_send_weights_group_ports=get_model().remote_instance_weight_loader_send_weights_group_ports,
-        remote_instance_weight_loader_backend=get_model().remote_instance_weight_loader_backend,
+        remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
+        remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
+        remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
+        remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
         remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
         remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
         modelexpress_url=server_args.modelexpress_url,
         modelexpress_transport=server_args.modelexpress_transport,
         modelopt_config=modelopt_config,
-        rl_quant_profile=get_model().rl_quant_profile,
+        rl_quant_profile=server_args.rl_quant_profile,
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
@@ -232,6 +234,7 @@ def build_load_config(
 def maybe_enable_ipc_weight_cache(
     *,
     load_config: LoadConfig,
+    server_args: ServerArgs,
     tp_size: int,
     pp_rank: int,
     tp_rank: int,
@@ -243,7 +246,7 @@ def maybe_enable_ipc_weight_cache(
     the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
     weight reload) can't overwrite the captured fallback format.
     """
-    if get_model().weight_cache_mode == "off":
+    if server_args.weight_cache_mode == "off":
         return
 
     if load_config.load_format != LoadFormat.IPC_CACHE:
@@ -275,13 +278,26 @@ def load_model_with_memory_saver(
     # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
 
-    enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
-        is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
+    if not is_draft_worker:
+        architectures = model_config.hf_config.architectures or []
+        is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
+        if server_args.ple_offload_embedding and not is_qwen4_exp:
+            raise ValueError(
+                "--ple-offload-embedding only supports "
+                "Qwen4ExpForConditionalGeneration"
+            )
+        if is_qwen4_exp:
+            model_config.hf_text_config.ple_offload_embedding = (
+                server_args.ple_offload_embedding
+            )
+
+    enable_cpu_backup = server_args.enable_weights_cpu_backup or (
+        is_draft_worker and server_args.enable_draft_weights_cpu_backup
     )
 
     # In zero-copy IPC mode, the weights are shared with the daemon via
     # CUDA IPC and must not be offloaded/reloaded by the memory saver.
-    is_ipc_zero_copy = get_model().weight_cache_mode != "off"
+    is_ipc_zero_copy = server_args.weight_cache_mode != "off"
     if is_ipc_zero_copy and enable_cpu_backup:
         logger.warning(
             "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
@@ -305,11 +321,12 @@ def load_model_with_memory_saver(
                 StartupWeightLoadManager,
             )
 
-            startup_weight_load = StartupWeightLoadManager.create_from_published_config(
+            startup_weight_load = StartupWeightLoadManager.create_from_server_args(
                 loader=loader,
                 model_config=model_config,
                 load_config=load_config,
                 device_config=device_config,
+                server_args=server_args,
                 is_draft_worker=is_draft_worker,
             )
             model = startup_weight_load.prepare()
@@ -322,6 +339,8 @@ def load_model_with_memory_saver(
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
             )
+    if not is_draft_worker and server_args.ple_offload_embedding and device == "cuda":
+        current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
     # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
     if _is_npu:

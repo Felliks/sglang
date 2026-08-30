@@ -22,17 +22,21 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from sglang.kernels.ops.activation.activation import (
     gelu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion import (
+from sglang.kernels.ops.diffusion.bitexact_gate import (
     BitExactFusionGate,
-    can_use_fused_rmsnorm_scale_shift,
-    can_use_fused_rope_rotate_half,
-    can_use_fused_scale_residual_rmsnorm_scale_shift,
     flashinfer_rmsnorm_diagnostic_hint,
-    fused_rmsnorm_scale_shift_bitexact,
-    fused_rope_rotate_half_bitexact,
-    fused_scale_residual_rmsnorm_scale_shift_bitexact,
-    residual_gate_add,
     tensors_equal,
+)
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
+from sglang.kernels.ops.diffusion.triton.rmsnorm_scale_shift_bitexact import (
+    can_use_fused_rmsnorm_scale_shift,
+    can_use_fused_scale_residual_rmsnorm_scale_shift,
+    fused_rmsnorm_scale_shift_bitexact,
+    fused_scale_residual_rmsnorm_scale_shift_bitexact,
+)
+from sglang.kernels.ops.diffusion.triton.rope_rotate_half_bitexact import (
+    can_use_fused_rope_rotate_half,
+    fused_rope_rotate_half_bitexact,
 )
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,

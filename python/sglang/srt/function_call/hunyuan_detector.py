@@ -12,7 +12,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +176,7 @@ class HunyuanDetector(BaseFormatDetector):
             if tool.function.name == function_name:
                 if tool.function.parameters is None:
                     return {}
-                return get_schema_properties(tool.function.parameters).get(arg_key, {})
+                return tool.function.parameters.get("properties", {}).get(arg_key, {})
         return {}
 
     @staticmethod

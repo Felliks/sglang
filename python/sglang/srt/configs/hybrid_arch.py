@@ -15,7 +15,6 @@ from sglang.srt.configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
-    MiniCPMHybridConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -41,9 +40,7 @@ def qwen3_next_config(model_config: ModelConfig):
 
 def hybrid_lightning_config(model_config: ModelConfig):
     config = model_config.hf_config
-    if isinstance(config, BailingHybridConfig) and not config.use_kda:
-        return config
-    if isinstance(config, MiniCPMHybridConfig) and config.has_lightning_layers:
+    if isinstance(config, BailingHybridConfig):
         return config
     return None
 
@@ -104,8 +101,6 @@ def mamba2_config(model_config: ModelConfig):
 def kimi_linear_config(model_config: ModelConfig):
     config = model_config.hf_config
     if isinstance(config, KimiLinearConfig):
-        return config
-    if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config
     text_config = getattr(config, "text_config", None)
     if isinstance(text_config, KimiLinearConfig):

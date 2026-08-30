@@ -139,21 +139,18 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 return_intermediate_states=return_intermediate_states,
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-            ),
-            None,
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
         )
 
     @staticmethod

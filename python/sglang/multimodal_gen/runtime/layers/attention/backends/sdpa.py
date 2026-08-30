@@ -24,8 +24,6 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.MATH,
 ]
 
-_MPS_VARLEN_QUERY_CHUNK_SIZE = 128
-
 
 class SDPABackend(AttentionBackend):
 
@@ -130,31 +128,13 @@ class SDPAImpl(AttentionImpl):
         for start, stop in zip(bounds[:-1], bounds[1:]):
             if start == stop:
                 continue
-            if query.device.type != "mps":
-                segment = self.forward(
-                    query[start:stop].unsqueeze(0),
-                    key[start:stop].unsqueeze(0),
-                    value[start:stop].unsqueeze(0),
-                    None,
-                )
-                output[start:stop].copy_(segment[0])
-                continue
-
-            # mps SDPA materializes a quadratic temporary for a varlen segment
-            # chunking query rows keeps every row's complete K/V context intact
-            keys = key[start:stop].unsqueeze(0)
-            values = value[start:stop].unsqueeze(0)
-            for query_start in range(start, stop, _MPS_VARLEN_QUERY_CHUNK_SIZE):
-                query_stop = min(query_start + _MPS_VARLEN_QUERY_CHUNK_SIZE, stop)
-                segment = self.forward(
-                    query[query_start:query_stop].unsqueeze(0),
-                    keys,
-                    values,
-                    None,
-                )
-                output[query_start:query_stop].copy_(segment[0])
-                torch.mps.synchronize()
-                torch.mps.empty_cache()
+            segment = self.forward(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+                None,
+            )
+            output[start:stop].copy_(segment[0])
         return output
 
 

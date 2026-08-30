@@ -81,8 +81,6 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     mmlu_num_examples = 256
     mmlu_num_threads = 32
     mgsm_en_score_threshold = 0.8
-    if _is_hip:
-        mgsm_en_num_threads = 32
 
 
 @unittest.skipIf(is_hip(), "Disabled for AMD-aiter")

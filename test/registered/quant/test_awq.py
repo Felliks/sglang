@@ -77,7 +77,7 @@ class TestAWQMarlinBfloat16(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.80)
+        self.assertGreater(metrics["score"], 0.83)
 
 
 if __name__ == "__main__":

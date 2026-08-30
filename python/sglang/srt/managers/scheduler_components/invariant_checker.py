@@ -98,9 +98,7 @@ class SchedulerInvariantChecker:
             else:
                 protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.req_to_token_pool.schedulable_token_capacity(
-                self.token_to_kv_pool_allocator.size
-            )
+            total = self.token_to_kv_pool_allocator.size
         else:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
@@ -166,20 +164,12 @@ class SchedulerInvariantChecker:
                 return leak, msg
             free_full_pages = set(free_pages.tolist() + release_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
-            full_page_msg = ""
-            if (
-                self.req_to_token_pool.schedulable_token_capacity(
-                    self.token_to_kv_pool_allocator.size
-                )
-                == self.token_to_kv_pool_allocator.size
-            ):
-                expected_full_pages = set(
-                    range(1, self.token_to_kv_pool_allocator.size + 1)
-                )
-                leaked_full_pages = (
-                    expected_full_pages - free_full_pages - cached_full_pages
-                )
-                full_page_msg = f", leaked_full_pages={leaked_full_pages or None}"
+            expected_full_pages = set(
+                range(1, self.token_to_kv_pool_allocator.size + 1)
+            )
+            leaked_full_pages = (
+                expected_full_pages - free_full_pages - cached_full_pages
+            )
             mamba_allocator = self.req_to_token_pool.mamba_allocator
             free_mamba_pages = set(mamba_allocator.free_slots.tolist())
             cached_mamba_pages = set(
@@ -189,8 +179,10 @@ class SchedulerInvariantChecker:
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
-            msg += full_page_msg
-            msg += f", leaked_mamba_pages={leaked_mamba_pages or None}"
+            msg += (
+                f", leaked_full_pages={leaked_full_pages or None}"
+                f", leaked_mamba_pages={leaked_mamba_pages or None}"
+            )
         return leak, msg
 
     def _check_mamba_pool_with_int8(self, ps: PoolStats, ckpt_pool) -> Tuple[bool, str]:
@@ -252,22 +244,19 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                if not req.is_holding_kv:
+                if req.kv is None:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.kv.cache_protected_len % self.page_size == 0
+                    assert req.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.kv.cache_protected_len
+                full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
                     swa_uncached += allocated_len - max(
-                        req.kv.cache_protected_len, req.kv.swa_evicted_seqlen
+                        req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
-
-                if req.beam_group is not None:
-                    full_uncached += req.beam_group.extra_uncached_tokens()
 
         return full_uncached, swa_uncached
 
@@ -324,7 +313,7 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
-                if not req.is_holding_kv:
+                if req.kv is None:
                     continue
                 _add_owner(
                     req,
@@ -462,8 +451,6 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
-        if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
-            return
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())

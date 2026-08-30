@@ -67,7 +67,7 @@ class TestDeepSeekOCR2OlmBenchXPU(CustomTestCase):
         "8192",
         "--disable-cuda-graph",
     ]
-    env = {}
+    env = {"SGLANG_USE_SGL_XPU": "1"}
 
     @classmethod
     def setUpClass(cls):

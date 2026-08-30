@@ -202,45 +202,42 @@ class Session:
             input_ids_unpadded += req.input_ids
         return input_ids, input_ids_unpadded
 
-    def _consume_asserted_full_prefix(
+    def _consume_exact_full_prefix(
         self, last_req: Req, req: TokenizedGenerateReqInput
     ) -> bool:
-        """Convert an exact full-prompt continuation into an append.
+        """Convert a verified full OpenAI transcript into an append-only turn.
 
-        OpenAI clients normally resend a complete transcript. For a streaming
-        session, a positive ``offset`` is therefore treated as a token-level
-        assertion: it must describe the entire last committed request and its
-        generated output. Only an exact match is stripped. This preserves the
-        independently valid OpenAI request while preventing stale or branched
-        histories from corrupting live KV/Mamba state.
+        ``offset`` is the exact live-state length. The incoming prefix must be
+        bit-for-bit identical to the committed origin and raw generated output;
+        clients must rebase through the ordinary Radix cache when a parsed
+        OpenAI tool/reasoning message canonicalizes to different token IDs.
         """
-        session_params = req.session_params
-        assert session_params is not None
-        offset = session_params.offset
-        if offset is None or offset <= 0:
+        params = req.session_params
+        assert params is not None
+        committed_offset = params.offset
+        if committed_offset is None or committed_offset <= 0:
             return False
         if self.committed_origin_len is None:
             return False
 
-        origin = last_req.origin_input_ids[: self.committed_origin_len]
-        output = last_req.output_ids_through_stop
-        expected_len = len(origin) + len(output)
-        if offset != expected_len or len(req.input_ids) < offset:
+        committed_origin = last_req.origin_input_ids[: self.committed_origin_len]
+        committed_output = last_req.output_ids_through_stop
+        expected_offset = len(committed_origin) + len(committed_output)
+        if committed_offset != expected_offset:
             return False
 
-        origin_len = len(origin)
-        if (
-            req.input_ids[:origin_len] != origin
-            or req.input_ids[origin_len:offset] != output
-        ):
+        if committed_offset > len(req.input_ids):
+            return False
+        if req.input_ids[:committed_offset] != committed_origin + committed_output:
             return False
 
-        req.input_ids = req.input_ids[offset:]
-        req.session_params = msgspec.structs.replace(session_params, offset=None)
+        req.input_ids = req.input_ids[committed_offset:]
+        req.session_params = msgspec.structs.replace(params, offset=None)
         logger.info(
-            "Streaming session %s verified full prompt: committed=%d suffix=%d",
+            "Streaming session %s verified exact full prompt: committed=%d "
+            "suffix=%d",
             self.session_id,
-            offset,
+            committed_offset,
             len(req.input_ids),
         )
         return True
@@ -280,21 +277,19 @@ class Session:
                 [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
                 if session_params.offset and session_params.offset != 0:
-                    if self._consume_asserted_full_prefix(last_req, req):
+                    if self._consume_exact_full_prefix(last_req, req):
                         session_params = req.session_params
                     else:
                         abort = True
                         abort_message = (
-                            "Streaming session offset does not match its last "
-                            "committed token prefix."
+                            "Streaming session full prompt does not match its "
+                            "last committed token state."
                         )
                         last_req_node = None
                         last_req = None
             elif session_params.offset and session_params.offset != 0:
                 abort = True
-                abort_message = (
-                    "Streaming session offset requires a committed request."
-                )
+                abort_message = "Streaming session offset requires a committed request."
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():

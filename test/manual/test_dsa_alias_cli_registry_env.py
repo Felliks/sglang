@@ -21,30 +21,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../python"))
 
 
 class TestDSAChoicesAndFields(unittest.TestCase):
-    """Verify DSA CLI choices and ServerArgs field renaming."""
+    """Verify DSA_CHOICES constant and ServerArgs field renaming."""
 
     def setUp(self):
-        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.server_args import (
+            DSA_CHOICES,
+            NSA_CHOICES,
+            ServerArgs,
+        )
 
         self.ServerArgs = ServerArgs
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        self.actions = {
-            option: action
-            for action in parser._actions
-            for option in action.option_strings
-        }
+        self.DSA_CHOICES = DSA_CHOICES
+        self.NSA_CHOICES = NSA_CHOICES
 
     def test_dsa_choices_is_canonical(self):
-        choices = self.actions["--dsa-prefill-backend"].choices
-        self.assertIn("fa3", choices)
-        self.assertIn("tilelang", choices)
-        self.assertIn("flashinfer_sparse_mla", choices)
+        self.assertIn("fa3", self.DSA_CHOICES)
+        self.assertIn("tilelang", self.DSA_CHOICES)
+        self.assertIn("flashinfer_sparse_mla", self.DSA_CHOICES)
 
-    def test_nsa_choices_match_dsa_choices(self):
-        self.assertEqual(
-            self.actions["--nsa-prefill-backend"].choices,
-            self.actions["--dsa-prefill-backend"].choices,
+    def test_nsa_choices_is_alias(self):
+        self.assertIs(
+            self.NSA_CHOICES,
+            self.DSA_CHOICES,
+            "NSA_CHOICES must be the same object as DSA_CHOICES",
         )
 
     def test_serverargs_has_dsa_fields(self):

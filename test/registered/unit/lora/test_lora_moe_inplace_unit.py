@@ -65,7 +65,6 @@ def _make_base_layer(quant_method=None) -> types.SimpleNamespace:
         moe_tp_size=1,
         moe_tp_rank=0,
         intermediate_size_per_partition=32,
-        runner=None,
     )
 
 

@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    PlainStateDictComponentLoader,
+    ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
@@ -158,26 +158,28 @@ def _infer_config_from_state_dict(state_dict: dict[str, torch.Tensor]) -> dict:
     return config
 
 
-def _load_explicit_config(
+def _load_config(
     safetensors_path: str,
     original_path: str,
-) -> dict | None:
-    """Load an explicit upsampler config with this fallback chain:
+    state_dict: dict[str, torch.Tensor],
+) -> dict:
+    """Load upsampler config with fallback chain:
     1. safetensors metadata ("config" key) - original LTX-2 repo format
     2. sibling config.json - diffusers format
     3. config.json from HF (if original_path was a URL)
+    4. infer from state dict shapes (always works)
     """
     with safetensors.safe_open(safetensors_path, framework="pt") as f:
         meta = f.metadata()
         if meta and "config" in meta:
             logger.info("Using config from safetensors metadata")
-            return json.loads(meta["config"])
+            return _normalize_config(json.loads(meta["config"]))
 
     config_json_path = os.path.join(os.path.dirname(safetensors_path), "config.json")
     if os.path.isfile(config_json_path):
         with open(config_json_path) as fp:
             logger.info("Using config from sibling config.json")
-            return json.load(fp)
+            return _normalize_config(json.load(fp))
 
     hf = _parse_hf_url(original_path)
     if hf:
@@ -187,17 +189,17 @@ def _load_explicit_config(
             local = _download_hf_file(repo_id, config_filename, revision)
             with open(local) as fp:
                 logger.info("Using config from HF config.json")
-                return json.load(fp)
+                return _normalize_config(json.load(fp))
         except Exception:
             pass
 
-    return None
+    logger.info("No explicit config found, inferring from state dict")
+    return _infer_config_from_state_dict(state_dict)
 
 
-class UpsamplerLoader(PlainStateDictComponentLoader):
+class UpsamplerLoader(ComponentLoader):
     component_names = ["spatial_upsampler"]
     expected_library = "diffusers"
-    supports_component_weight_override = True
 
     def load_customized(
         self,
@@ -205,20 +207,9 @@ class UpsamplerLoader(PlainStateDictComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ):
-        component_weights_path = self.resolve_component_weights_path(
-            component_model_path, server_args, component_name
-        )
-        safetensors_path = _find_safetensors_file(component_weights_path)
-        raw_config = _load_explicit_config(safetensors_path, component_model_path)
-        if raw_config is not None:
-            self.ensure_plain_state_dict_checkpoint(raw_config, component_name)
-
+        safetensors_path = _find_safetensors_file(component_model_path)
         state_dict = safetensors_load_file(safetensors_path)
-        if raw_config is None:
-            logger.info("No explicit config found, inferring from state dict")
-            config = _infer_config_from_state_dict(state_dict)
-        else:
-            config = _normalize_config(raw_config)
+        config = _load_config(safetensors_path, component_model_path, state_dict)
 
         logger.info("Loading LatentUpsampler with config: %s", config)
 

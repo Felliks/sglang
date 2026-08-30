@@ -16,6 +16,8 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.managers.io_struct import SessionParams
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -99,6 +101,33 @@ class TestSessionTokenShare(CustomTestCase):
         r3 = self._create("r3", [9])
         self.assertEqual(list(r3.origin_input_ids), in1 + out1 + in2 + out2 + [9])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
+
+    def test_exact_full_prompt_is_reduced_to_append_only_suffix(self):
+        in1, out1 = [100, 101, 102], [201, 202]
+        r1 = self._create("r1", in1)
+        self._decode_and_finish(r1, out1)
+
+        suffix = [301, 302]
+        recv = _recv("r2", in1 + out1 + suffix)
+        recv.session_params = SessionParams(id="s", offset=len(in1) + len(out1))
+        with get_parallel().override(tp_rank=0):
+            r2 = self.session.create_req(recv, tokenizer=None, vocab_size=VOCAB)
+
+        self.assertIsNone(r2.finished_reason)
+        self.assertEqual(list(r2.origin_input_ids), in1 + out1 + suffix)
+
+    def test_full_prompt_token_mismatch_is_rejected(self):
+        in1, out1 = [100, 101, 102], [201, 202]
+        r1 = self._create("r1", in1)
+        self._decode_and_finish(r1, out1)
+
+        recv = _recv("r2", [999, 101, 102] + out1 + [301])
+        recv.session_params = SessionParams(id="s", offset=len(in1) + len(out1))
+        with get_parallel().override(tp_rank=0):
+            r2 = self.session.create_req(recv, tokenizer=None, vocab_size=VOCAB)
+
+        self.assertIsNotNone(r2.to_finish)
+        self.assertEqual(len(self.session.req_nodes), 1)
 
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]

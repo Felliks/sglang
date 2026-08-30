@@ -31,11 +31,6 @@ from sglang.srt.runtime_context import get_parallel
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 
-def unwrap_lora_layer(module: nn.Module) -> nn.Module:
-    """Return the plain module behind a LoRA wrapper, or the module itself."""
-    return module.base_layer if isinstance(module, BaseLayerWithLoRA) else module
-
-
 class BaseLayerWithLoRA(nn.Module):
     def __init__(
         self,
@@ -970,14 +965,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             base_layer.should_fuse_routed_scaling_factor_in_topk
         )
 
-        self.tp_size = base_layer.moe_tp_size
-        self.tp_rank = base_layer.moe_tp_rank
-        self.intermediate_size_per_partition = (
-            base_layer.intermediate_size_per_partition
+        self.tp_size = getattr(base_layer, "moe_tp_size", 1)
+        self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
+        self.intermediate_size_per_partition = getattr(
+            base_layer, "intermediate_size_per_partition", None
         )
-        # Stock MoE LoRA buffers are split gate/up except for GPT-OSS-style weights.
         self._uses_interleaved_gate_up = (
-            base_layer.moe_runner_config.gemm1_alpha is not None
+            getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
         )
 
         # Initialize triton_lora moe runner for batches with lora enabled
@@ -985,13 +979,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        # Use the runner selected by the quant method so per-format backend resolution
-        # stays identical between base and LoRA forwards.
+        # Determine runner backend: prefer server arg, fall back to quant method's runner
         global_backend = get_moe_runner_backend()
-        if base_layer.runner is not None:
-            runner_backend = base_layer.runner.runner_backend
-        elif not global_backend.is_auto():
+        if not global_backend.is_auto():
             runner_backend = global_backend
+        elif (
+            hasattr(base_layer.quant_method, "runner")
+            and base_layer.quant_method.runner is not None
+        ):
+            runner_backend = base_layer.quant_method.runner.runner_backend
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
@@ -1050,9 +1046,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
         else:
-            assert base_layer.quant_method is not None, "Quant method must be set"
-            self._quant_info = base_layer.quant_method.get_moe_quant_info(
-                base_layer, runner_backend
+            raise NotImplementedError(
+                f"LoRA MoE not supported for backend {runner_backend}"
             )
 
     def set_lora_info(

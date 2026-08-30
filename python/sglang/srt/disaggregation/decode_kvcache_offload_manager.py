@@ -21,11 +21,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.runtime_context import (
-    get_memory,
-    get_schedule,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_schedule
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -43,6 +40,7 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
+        server_args: ServerArgs,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -62,6 +60,7 @@ class DecodeKVCacheOffloadManager:
         self.decode_host_mem_pool = build_kv_host_pool(
             kv_pool=kv_cache,
             page_size=self.page_size,
+            server_args=server_args,
             use_mla=isinstance(kv_cache, MLATokenToKVPool),
         )
 
@@ -69,10 +68,10 @@ class DecodeKVCacheOffloadManager:
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         hicache_storage_backend_extra_config = {}
-        if get_memory().hicache_storage_backend_extra_config:
+        if server_args.hicache_storage_backend_extra_config:
             try:
                 hicache_storage_backend_extra_config = json.loads(
-                    get_memory().hicache_storage_backend_extra_config
+                    server_args.hicache_storage_backend_extra_config
                 )
             except json.JSONDecodeError as e:
                 raise ValueError(
@@ -84,38 +83,34 @@ class DecodeKVCacheOffloadManager:
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
             tp_group=tp_group,
-            io_backend=get_memory().hicache_io_backend,
+            io_backend=server_args.hicache_io_backend,
             load_cache_event=threading.Event(),
-            storage_backend=get_memory().hicache_storage_backend,
-            model_name=get_serving().served_model_name,
+            storage_backend=server_args.hicache_storage_backend,
+            model_name=server_args.served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
         )
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
-        # A caller may reuse a rid as soon as the previous response finishes,
-        # while that request's asynchronous D2H copy is still in flight. Key
-        # lifecycle state by the Req instance so a late ack cannot mutate the
-        # new request's state.
-        self.offloaded_state: dict[Req, OffloadedState] = {}
-        self.offload_inflight: dict[Req, int] = {}
+        self.offloaded_state = {}
+        self.offload_inflight = {}
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:
         self.decode_host_mem_pool.destroy()
 
-    def _mark_offload_started(self, req: Req):
-        self.offload_inflight[req] = self.offload_inflight.get(req, 0) + 1
+    def _mark_offload_started(self, rid):
+        self.offload_inflight[rid] = self.offload_inflight.get(rid, 0) + 1
 
-    def _mark_offload_finished(self, req: Req):
-        count = self.offload_inflight.get(req, 0)
+    def _mark_offload_finished(self, rid):
+        count = self.offload_inflight.get(rid, 0)
         if count <= 1:
-            self.offload_inflight.pop(req, None)
+            self.offload_inflight.pop(rid, None)
         else:
-            self.offload_inflight[req] = count - 1
+            self.offload_inflight[rid] = count - 1
 
-    def _has_inflight_offload(self, req: Req):
-        return self.offload_inflight.get(req, 0) > 0
+    def _has_inflight_offload(self, rid):
+        return self.offload_inflight.get(rid, 0) > 0
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -135,7 +130,7 @@ class DecodeKVCacheOffloadManager:
         prefill_offloaded_len = (
             len(req.origin_input_ids) // self.page_size * self.page_size
         )
-        state = self.offloaded_state.get(req)
+        state = self.offloaded_state.get(req.rid)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
                 req.origin_input_ids[:prefill_offloaded_len]
@@ -148,7 +143,7 @@ class DecodeKVCacheOffloadManager:
                 inc_len=0,
                 last_hash=last_prefill_hash,
             )
-            self.offloaded_state[req] = state
+            self.offloaded_state[req.rid] = state
         incremental_total = len(all_tokens) - state.prefill_len
         incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
@@ -181,7 +176,7 @@ class DecodeKVCacheOffloadManager:
             logger.error(f"Not enough host memory for request {req.rid}")
             return False
 
-        self._mark_offload_started(req)
+        self._mark_offload_started(req.rid)
         self.ongoing_offload[ack_id] = (
             req,
             host_indices,
@@ -228,20 +223,20 @@ class DecodeKVCacheOffloadManager:
                     end,
                 ) = self.ongoing_offload.pop(ack_id)
 
-                self._mark_offload_finished(req)
+                self._mark_offload_finished(req.rid)
                 prior_hash = (
-                    self.offloaded_state[req].last_hash
-                    if req in self.offloaded_state
+                    self.offloaded_state[req.rid].last_hash
+                    if req.rid in self.offloaded_state
                     else None
                 )
                 last_hash = self._trigger_backup(
                     req, host_indices, incremental_tokens, start_time, prior_hash
                 )
-                if req in self.offloaded_state:
-                    self.offloaded_state[req].last_hash = last_hash
+                if req.rid in self.offloaded_state:
+                    self.offloaded_state[req.rid].last_hash = last_hash
 
-                if req.finished() and not self._has_inflight_offload(req):
-                    state = self.offloaded_state.get(req)
+                if req.finished() and not self._has_inflight_offload(req.rid):
+                    state = self.offloaded_state.get(req.rid)
                     start_offset = state.prefill_len if state is not None else start
                     self._release_finished_req(req, start_offset)
             finish_count -= 1
@@ -261,7 +256,7 @@ class DecodeKVCacheOffloadManager:
         # concurrent admission. Now consolidated here at request
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
-        state = self.offloaded_state.get(req)
+        state = self.offloaded_state.get(req.rid)
         if state is not None and state.prefill_len > 0:
             prefill_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : state.prefill_len
@@ -285,9 +280,10 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        req.kv.mark_released()
+        req.kv = None
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
-        self.offloaded_state.pop(req, None)
+        if req.rid in self.offloaded_state:
+            del self.offloaded_state[req.rid]
 
     def _check_backup_progress(self, finish_count):
         """Check the progress of backup from host to storage."""
@@ -331,7 +327,7 @@ class DecodeKVCacheOffloadManager:
         # guard against both sentinels here.
         if req.req_pool_idx is None or req.req_pool_idx == -1:
             return
-        state = self.offloaded_state.get(req)
+        state = self.offloaded_state.get(req.rid)
         if state is None:
             prefill_len = len(req.origin_input_ids) // self.page_size * self.page_size
             inc_len = 0
@@ -341,10 +337,10 @@ class DecodeKVCacheOffloadManager:
         # Prefill-aligned slots are freed by _release_finished_req. Make
         # sure state exists so it can find prefill_len.
         if state is None:
-            self.offloaded_state[req] = OffloadedState(
+            self.offloaded_state[req.rid] = OffloadedState(
                 prefill_len=prefill_len, inc_len=0, last_hash=None
             )
-        if self._has_inflight_offload(req):
+        if self._has_inflight_offload(req.rid):
             return
         start_offset = prefill_len
         self._release_finished_req(req, start_offset)

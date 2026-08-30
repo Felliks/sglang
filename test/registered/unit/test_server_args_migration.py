@@ -7,7 +7,6 @@ translates field annotations into argparse arguments.
 import argparse
 import unittest
 
-from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,11 +24,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def _parse(self, args_list):
         args = self.parser.parse_args(["--model", "dummy"] + args_list)
-        server_args = ServerArgs.from_cli_args(args)
-        # Parsing hands back the raw record; the cases below read values that
-        # resolution normalises, so resolve here the way a launcher would.
-        server_args.resolve_once()
-        return server_args
+        return ServerArgs.from_cli_args(args)
 
     def test_aliases_and_dest(self):
         """Field name drives dest; long forms and short aliases both work."""
@@ -96,10 +91,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     "32",
                 ]
             )
-            # The normalization is a declaration.
             self.assertEqual(
-                resolution_result(sa, "allowed_media_domains"),
-                ["127.0.0.1", "media.example.com"],
+                sa.allowed_media_domains, ["127.0.0.1", "media.example.com"]
             )
             self.assertEqual(sa.media_url_max_file_size_mb, 32)
         finally:

@@ -4,7 +4,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
@@ -238,9 +237,7 @@ class TestServerArgsHook(_RegistryIsolated):
 
         handle_speculative_decoding(server_args)
 
-        self.assertEqual(
-            resolution_result(server_args, "speculative_algorithm"), "MY_HANDLE_ARGS"
-        )
+        self.assertEqual(server_args.speculative_algorithm, "MY_HANDLE_ARGS")
         self.assertEqual(server_args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
         self.assertEqual(server_args.speculative_num_draft_tokens, 7)
 

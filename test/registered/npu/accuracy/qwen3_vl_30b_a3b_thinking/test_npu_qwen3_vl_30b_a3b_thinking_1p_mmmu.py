@@ -9,9 +9,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=8400,
-    suite="nightly-acc-2-npu-a3",
+    est_time=3600,
+    suite="",
     nightly=True,
+    disabled="performance testcase",
 )
 
 ENVS = {
@@ -20,7 +21,7 @@ ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "DEEPEP_HCCL_BUFFSIZE": "2000",
+    "HCCL_BUFFSIZE": "2000",
 }
 
 OTHER_ARGS = [
@@ -54,7 +55,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestQwen3_VL_30B_A3B_Thinking_MMMU(TestNpuAccuracyTestCaseBase):
+class TestQwen3(TestNpuAccuracyTestCaseBase):
     model = QWEN3_VL_30B_A3B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

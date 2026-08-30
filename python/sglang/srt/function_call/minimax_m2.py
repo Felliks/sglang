@@ -10,7 +10,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -509,8 +508,8 @@ class MinimaxM2Detector(BaseFormatDetector):
         for tool in tools:
             if tool.function.name == fname and tool.function.parameters is not None:
                 parameters = tool.function.parameters
-                if isinstance(parameters, dict):
-                    param_config = get_schema_properties(parameters)
+                if isinstance(parameters, dict) and "properties" in parameters:
+                    param_config = parameters["properties"]
                     break
 
         param_type = self._get_param_types_from_config(pname, param_config)
