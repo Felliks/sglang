@@ -318,6 +318,26 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
+    def test_convert_to_internal_request_preserves_session_params(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Continue"}],
+            session_params={"id": "streaming-session", "offset": 128},
+        )
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(request)
+
+        self.assertEqual(
+            adapted.session_params,
+            {"id": "streaming-session", "offset": 128},
+        )
+        self.assertIsNone(adapted.session_id)
+
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
             model="x",
