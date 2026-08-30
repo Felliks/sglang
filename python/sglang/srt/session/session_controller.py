@@ -18,6 +18,8 @@ import uuid
 from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
+import msgspec
+
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -200,6 +202,57 @@ class Session:
             input_ids_unpadded += req.input_ids
         return input_ids, input_ids_unpadded
 
+    def _consume_asserted_full_prefix(
+        self, last_req: Req, req: TokenizedGenerateReqInput
+    ) -> bool:
+        """Convert a verified full OpenAI transcript into an append-only turn.
+
+        ``offset`` is the exact live-state length. ``input_offset`` optionally
+        points at the new suffix in a canonically re-tokenized transcript. When
+        the two differ, the entire previously committed origin must still match
+        bit-for-bit; only the immediately preceding generated output is allowed
+        to have a different canonical representation.
+        """
+        params = req.session_params
+        assert params is not None
+        committed_offset = params.offset
+        if committed_offset is None or committed_offset <= 0:
+            return False
+        if self.committed_origin_len is None:
+            return False
+
+        committed_origin = last_req.origin_input_ids[: self.committed_origin_len]
+        committed_output = last_req.output_ids_through_stop
+        expected_offset = len(committed_origin) + len(committed_output)
+        if committed_offset != expected_offset:
+            return False
+
+        input_offset = params.input_offset or committed_offset
+        if not len(committed_origin) <= input_offset <= len(req.input_ids):
+            return False
+        if req.input_ids[: len(committed_origin)] != committed_origin:
+            return False
+        if (
+            params.input_offset is None
+            and req.input_ids[len(committed_origin) : input_offset]
+            != committed_output
+        ):
+            return False
+
+        req.input_ids = req.input_ids[input_offset:]
+        req.session_params = msgspec.structs.replace(
+            params, offset=None, input_offset=None
+        )
+        logger.info(
+            "Streaming session %s verified full prompt: committed=%d "
+            "input_boundary=%d suffix=%d",
+            self.session_id,
+            committed_offset,
+            input_offset,
+            len(req.input_ids),
+        )
+        return True
+
     def create_req(
         self,
         req: TokenizedGenerateReqInput,
@@ -228,15 +281,28 @@ class Session:
                 abort_message = (
                     "Streaming sessions do not support drop_previous_output."
                 )
-            elif session_params.offset and session_params.offset != 0:
-                abort = True
-                abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
                 # Peek (don't pop) the single req_node. req_nodes is updated
                 # only in finish_req after the request completes successfully.
                 [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
+                if session_params.offset and session_params.offset != 0:
+                    if self._consume_asserted_full_prefix(last_req, req):
+                        session_params = req.session_params
+                    else:
+                        abort = True
+                        abort_message = (
+                            "Streaming session full prompt does not match its "
+                            "last committed token state."
+                        )
+                        last_req_node = None
+                        last_req = None
+            elif session_params.offset and session_params.offset != 0:
+                abort = True
+                abort_message = (
+                    "Streaming session offset requires a committed request."
+                )
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():

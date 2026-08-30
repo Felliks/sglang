@@ -129,6 +129,12 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # spliced into the accumulated context at this position instead of being
     # appended at the end (i.e. ``context[:offset] + new_tokens``).
     offset: Optional[int] = None
+    # Token boundary in a re-tokenized full prompt. Streaming OpenAI clients
+    # may canonicalize the last generated assistant/tool message differently
+    # from the raw generated token stream. In that case ``offset`` identifies
+    # the exact committed KV/Mamba length, while ``input_offset`` identifies
+    # where the newly appended suffix starts in the incoming token array.
+    input_offset: Optional[int] = None
     # When True, the request node identified by ``rid`` (or all nodes if
     # ``rid`` is None) is aborted and its children are cleared before the new
     # request is inserted. Not supported in streaming sessions.

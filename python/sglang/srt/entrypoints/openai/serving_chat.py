@@ -1023,6 +1023,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             session_id=request.session_id,
+            session_params=request.session_params,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
             require_reasoning=processed_messages.require_reasoning,
