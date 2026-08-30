@@ -277,9 +277,9 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 def _handle_dspark(server_args: ServerArgs) -> None:
     _is_npu = server_args.device.startswith("npu")
-    if not server_args.device.startswith("cuda") and not _is_npu:
+    if not server_args.device.startswith(("cuda", "npu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA and NPU devices."
+            "DSpark speculative decoding only supports CUDA or NPU device."
         )
 
     # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
@@ -590,6 +590,10 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        # Qwen4-Exp MTP: the NEXTN draft layer ships inside the target
+        # checkpoint (model.mtp.*), so the draft model path defaults to
+        # the target model path.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if server_args.speculative_draft_model_path is None:
             server_args.speculative_draft_model_path = server_args.model_path

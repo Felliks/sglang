@@ -201,6 +201,14 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
 
+    # LongCat computes fresh top-k indices every cli_factor layers.
+    cli_factor = getattr(config, "cli_factor", 1)
+    if cli_factor is None:
+        cli_factor = 1
+    assert cli_factor > 0, f"cli_factor must be positive, got {cli_factor}"
+    if cli_factor > 1:
+        return layer_id % cli_factor != 0
+
     pattern = getattr(config, "index_topk_pattern", None)
     if pattern is not None:
         return layer_id < len(pattern) and pattern[layer_id] == "S"
@@ -231,11 +239,12 @@ REQUANTIZATION_METHODS = ["quark_mxfp4"]
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
-    DSA models (V3.2) instantiate an Indexer on every transformer layer.
-    With index_topk_freq > 1 some layers reuse prev layer's topk; those still
-    get a slot (mirrored at the MLA call site). DSv4 has C4 indexers only on
-    layers whose compress_ratio == 4. Other architectures: set
-    num_indexer_layers on hf_text_config; 0 disables the capturer.
+    DSA models (V3.2) expose one capturer slot per transformer layer. With
+    index_topk_freq > 1 some layers reuse prev layer's topk; those still get a
+    slot mirrored at the MLA call site even if no Indexer module is built.
+    DSv4 has C4 indexers only on layers whose compress_ratio == 4. Other
+    architectures: set num_indexer_layers on hf_text_config; 0 disables the
+    capturer.
     """
     if is_deepseek_dsa(config):
         return config.num_hidden_layers
@@ -689,6 +698,24 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+        ):
+            # The target's ModelConfig shares this hf_config object; deep-copy
+            # before the MTP rewrites below so the target keeps its full depth.
+            self.hf_config = copy.deepcopy(self.hf_config)
+            self.hf_text_config = get_hf_text_config(self.hf_config)
+            self.hf_config.architectures[0] = "Qwen4ExpForCausalLMMTP"
+            text_config = self.hf_text_config
+            text_config.num_nextn_predict_layers = 1
+            # Collapse to a single full_attention layer so the draft's
+            # full_attention_layer_ids is [0]. Qwen4ExpTextConfig.layers_block_type
+            # bypasses num_hidden_layers when layer_types is set.
+            text_config.num_hidden_layers = 1
+            text_config.layer_types = ["full_attention"]
+            text_config.full_attention_interval = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.hf_config.architectures[0] = "Qwen3MoeForCausalLMMTP"
@@ -1854,6 +1881,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
@@ -1913,6 +1941,8 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    # Qwen4-Exp is intentionally absent: QSA builds host-side sparse metadata
+    # per forward and cannot serve the breakable prefill capture.
     "MuseGlimmerForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",

@@ -64,6 +64,8 @@ from sglang.srt.configs import (
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
     Qwen3NextConfig,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
@@ -108,6 +110,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         KimiK3Config,
         KimiLinearConfig,
         Qwen3NextConfig,
+        Qwen4ExpConfig,
+        Qwen4ExpTextConfig,
         FalconH1Config,
         GraniteMoeHybridConfig,
         DotsVLMConfig,
@@ -365,7 +369,8 @@ def get_rope_config(config):
     """
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
-        return rope_params["rope_theta"], rope_params
+        rope_theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000))
+        return rope_theta, rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 
 

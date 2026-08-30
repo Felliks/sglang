@@ -15,6 +15,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -88,6 +89,17 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    memory_config = get_memory()
+    return (
+        not memory_config.enable_hisparse
+        and not is_draft_worker
+        and not memory_config.enable_hierarchical_cache
+        and get_disagg().disaggregation_mode == "null"
+    )
+
 
 _is_hip = is_hip()
 
@@ -870,6 +882,20 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        ple_kwargs = {}
+        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            ple_kwargs = dict(
+                short_conv_layer_ids=[
+                    i
+                    for i in self.mambaish_config.short_conv_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ],
+                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
+                ngram_context_len=self.mambaish_config.ngram_context_len,
+                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
+            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -887,6 +913,7 @@ class KVCacheConfigurator:
             ),
             enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
+            **ple_kwargs,
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
@@ -1035,6 +1062,7 @@ class KVCacheConfigurator:
             elif self.mambaish_config:
                 token_to_kv_pool = self._build_hybrid_linear_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_running_requests=sizes.max_running_requests,
                     req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
                 )
@@ -1082,37 +1110,18 @@ class KVCacheConfigurator:
         else:
             compression_ratios = self.model_config.compress_ratios
 
-        # NPU + DSV4 → paged-state subclass: the fused compressor kernel
-        # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
-        # so the CUDA ring-buffer state path can't be shared. CUDA keeps
-        # DeepSeekV4TokenToKVPool unchanged; NPU recomputes state sizes below.
+        # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
+        # follows the same fixed ring ownership as GPU. Do not replace the
+        # configurator's C4-SWA/C128-request budgets with a paged allocator
+        # estimate: Atlas A3 cache_mode=2 consumes explicit flat state_locs.
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
-                npu_state_pool_size,
             )
 
             pool_cls = DSV4NPUTokenToKVPool
-            # Recompute state pool sizes for the NPU paged formula (CUDA's
-            # ring sizes are dropped here). Tail-only allocation keeps the
-            # per-req-budget formula sufficient at any prefill length: long
-            # prompts allocate only ``tail+128`` (c4) / ``tail`` (c128)
-            # slots (tail = seq_len % 128), and decode is drained by
-            # sliding eviction in ``ScheduleBatch._evict_swa``.
-            c4_state_pool_size = npu_state_pool_size(
-                ratio=4,
-                page_size=get_schedule().page_size,
-                max_num_reqs=max_running_requests,
-            )
-            c128_state_pool_size = npu_state_pool_size(
-                ratio=128,
-                page_size=get_schedule().page_size,
-                max_num_reqs=max_running_requests,
-            )
         else:
             pool_cls = DeepSeekV4TokenToKVPool
-            c4_state_pool_size = c4_state_pool_size
-            c128_state_pool_size = c128_state_pool_size
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -1343,6 +1352,13 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+            pool_kwargs["skip_topk_layers"] = [
+                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                for layer_id in range(
+                    self.layer_info.start_layer, self.layer_info.end_layer
+                )
+            ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1502,6 +1518,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_total_num_tokens: int,
+        max_running_requests: int,
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
     ) -> KVCache:
@@ -1530,7 +1547,36 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
-        token_to_kv_pool = HybridLinearKVPool(
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_TOKENWISE,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        qsa_profile = parse_qsa_profile(self.model_config.hf_text_config)
+        if qsa_profile is None:
+            pool_class = HybridLinearKVPool
+            extra_args["use_mla"] = self.use_mla_backend
+        elif qsa_profile.variant == QSA_VARIANT_TOKENWISE:
+            pool_class = QwenDSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_token_budget=qsa_profile.budget,
+            )
+        else:
+            pool_class = QSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_token_topk=qsa_profile.budget,
+                num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            )
+        token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
@@ -1544,7 +1590,6 @@ class KVCacheConfigurator:
             mamba_pool=req_to_token_pool.mamba_pool,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            use_mla=self.use_mla_backend,
             start_layer=self.layer_info.start_layer,
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,
@@ -1739,6 +1784,7 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
+            # The draft's QSA page ledger is registered with its pools at the
             if self.is_hybrid_swa:
                 if self.draft_swa_full_capacity:
                     # Banded depth: the SWA ring is full draft capacity, so use

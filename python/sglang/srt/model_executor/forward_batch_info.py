@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, mamba_cache_chunk_size
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -301,59 +301,23 @@ def compute_local_num_token_non_padded_cpu(
 class DSV4OutCacheLoc:
     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
 
-    Bundles slot indices for full/SWA pools, the two compressed-KV pools
-    (c4/c128), and the two compressed-state pools (c4_state/c128_state).
+    Bundles slot indices for full/SWA pools and the two compressed-KV pools
+    (C4/C128). Compressor state uses fixed ring storage and explicit
+    ``state_loc`` metadata, so it is not part of the token-allocation bundle.
     Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
     the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
-    otherwise. CUDA's DSV4 path doesn't construct this bundle (state is
-    derived via translate_kv_loc_to_compress_state_loc there).
+    otherwise.
 
     All fields are token-level slot ids in their respective pools (NOT page
     ids). Attention backends convert to page ids via ``// page_size`` when
     constructing PA_ND block tables.
 
-    State fields default to ``None`` so the bundle is constructible from
-    paths that allocate KV but not state (or vice versa); the NPU allocator
-    fills all six on real alloc, CUDA paths leave state ones None and use
-    the ring-hash translation instead.
     """
 
     out_full_loc: torch.Tensor
     out_swa_loc: torch.Tensor
     out_c4_loc: torch.Tensor
     out_c128_loc: torch.Tensor
-    out_c4_state_loc: Optional[torch.Tensor] = None
-    out_c128_state_loc: Optional[torch.Tensor] = None
-
-
-@dataclass
-class DSV4StateLens:
-    """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
-
-    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
-    threaded through ``mem_cache/common.py`` to
-    ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
-
-      * ``c{4,128}_prefix_lens`` / ``..._cpu`` — per-req prev cumulative
-        state-slot count (the paged allocator's ``prefix`` contract).
-      * ``c{4,128}_seq_lens`` / ``..._cpu`` — per-req new cumulative count.
-      * ``c{4,128}_extend_num_tokens`` — total new state slots this step.
-
-    Replaces the 10 loose ``c{4,128}_state_*`` kwargs the allocator used to
-    take: scheduler only produces this object, common only forwards it, the
-    allocator only consumes it.
-    """
-
-    c4_prefix_lens: torch.Tensor
-    c4_prefix_lens_cpu: torch.Tensor
-    c4_seq_lens: torch.Tensor
-    c4_seq_lens_cpu: torch.Tensor
-    c4_extend_num_tokens: int
-    c128_prefix_lens: torch.Tensor
-    c128_prefix_lens_cpu: torch.Tensor
-    c128_seq_lens: torch.Tensor
-    c128_seq_lens_cpu: torch.Tensor
-    c128_extend_num_tokens: int
 
 
 @dataclass
@@ -448,6 +412,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+
+    # Trailing synthetic request rows of a padded CUDA-graph replay. Stamped by
+    # the graph runners for backends whose seq-len fill value is ambiguous
+    # (QSA's fill is 1, a legal real length); None outside replay.
+    num_padding: Optional[int] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -1032,6 +1001,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
         )
+
+    def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
+        """Tokens of THIS extend chunk covered by the tracked (extra-buffer) state.
+
+        The extra-buffer scheduler parks its snapshot at a `mamba_cache_chunk_size`
+        boundary, not at the current position, so anything snapshotting alongside it
+        needs the same boundary. Sole home of this math: `_init_track_conv_indices`
+        and the Qwen4-Exp PLE side states all call it so they cannot drift apart. The
+        `+1` that `_force_track_h` adds cancels under the floor division, which is
+        why one expression serves both.
+
+        None when tracking metadata is absent (no mask, or a prefill CUDA-graph
+        replay that does not carry `mamba_track_seqlens` — mamba skips tracking there
+        too). Masked-off rows hold garbage and are the caller's mask to handle.
+        """
+        if (
+            self.mamba_track_mask is None
+            or self.mamba_track_seqlens is None
+            or self.extend_prefix_lens is None
+        ):
+            return None
+
+        chunk_size = mamba_cache_chunk_size()
+        lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
+        return (lens_to_track // chunk_size) * chunk_size
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
