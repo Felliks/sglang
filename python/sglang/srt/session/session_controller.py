@@ -18,6 +18,8 @@ import uuid
 from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
+import msgspec
+
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -200,6 +202,49 @@ class Session:
             input_ids_unpadded += req.input_ids
         return input_ids, input_ids_unpadded
 
+    def _consume_asserted_full_prefix(
+        self, last_req: Req, req: TokenizedGenerateReqInput
+    ) -> bool:
+        """Convert an exact full-prompt continuation into an append.
+
+        OpenAI clients normally resend a complete transcript. For a streaming
+        session, a positive ``offset`` is therefore treated as a token-level
+        assertion: it must describe the entire last committed request and its
+        generated output. Only an exact match is stripped. This preserves the
+        independently valid OpenAI request while preventing stale or branched
+        histories from corrupting live KV/Mamba state.
+        """
+        session_params = req.session_params
+        assert session_params is not None
+        offset = session_params.offset
+        if offset is None or offset <= 0:
+            return False
+        if self.committed_origin_len is None:
+            return False
+
+        origin = last_req.origin_input_ids[: self.committed_origin_len]
+        output = last_req.output_ids_through_stop
+        expected_len = len(origin) + len(output)
+        if offset != expected_len or len(req.input_ids) < offset:
+            return False
+
+        origin_len = len(origin)
+        if (
+            req.input_ids[:origin_len] != origin
+            or req.input_ids[origin_len:offset] != output
+        ):
+            return False
+
+        req.input_ids = req.input_ids[offset:]
+        req.session_params = msgspec.structs.replace(session_params, offset=None)
+        logger.info(
+            "Streaming session %s verified full prompt: committed=%d suffix=%d",
+            self.session_id,
+            offset,
+            len(req.input_ids),
+        )
+        return True
+
     def create_req(
         self,
         req: TokenizedGenerateReqInput,
@@ -228,15 +273,28 @@ class Session:
                 abort_message = (
                     "Streaming sessions do not support drop_previous_output."
                 )
-            elif session_params.offset and session_params.offset != 0:
-                abort = True
-                abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
                 # Peek (don't pop) the single req_node. req_nodes is updated
                 # only in finish_req after the request completes successfully.
                 [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
+                if session_params.offset and session_params.offset != 0:
+                    if self._consume_asserted_full_prefix(last_req, req):
+                        session_params = req.session_params
+                    else:
+                        abort = True
+                        abort_message = (
+                            "Streaming session offset does not match its last "
+                            "committed token prefix."
+                        )
+                        last_req_node = None
+                        last_req = None
+            elif session_params.offset and session_params.offset != 0:
+                abort = True
+                abort_message = (
+                    "Streaming session offset requires a committed request."
+                )
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():
