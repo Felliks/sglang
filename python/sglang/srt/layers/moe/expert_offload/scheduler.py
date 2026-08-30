@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
@@ -94,6 +95,9 @@ class DeadlineExpertScheduler:
             "demand_accesses": 0,
             "demand_cache_hits": 0,
             "demand_reads": 0,
+            "demand_batches": 0,
+            "demand_batch_misses": 0,
+            "max_demand_batch_misses": 0,
             "publication_failures": 0,
         }
 
@@ -289,10 +293,40 @@ class DeadlineExpertScheduler:
         if failures:
             raise RuntimeError("expert publication failed") from failures[0]
 
+    def _wait_and_publish(
+        self,
+        identity: ExpertIdentity,
+        transfer: _Transfer,
+        *,
+        discard_expired: bool = False,
+    ) -> bool:
+        record = transfer.future.result()
+        if (
+            discard_expired
+            and not transfer.demand
+            and transfer.publication is None
+            and transfer.deadline_ns is not None
+            and self._clock_ns() > transfer.deadline_ns
+        ):
+            record.release()
+            self._cache.fail(transfer.admission)
+            del self._transfers[identity]
+            self.metrics["prefetch_expired"] += 1
+            return False
+        if transfer.publication is None:
+            self._begin_publication(transfer)
+        assert transfer.publication is not None
+        transfer.publication.wait()
+        self._finalize(identity, transfer)
+        return True
+
     def demand(self, identities: Iterable[ExpertIdentity]) -> list[SlotLease]:
         self._check_thread()
         requested = list(dict.fromkeys(identities))
-        leases = []
+        leases: list[SlotLease] = []
+        missing = deque[ExpertIdentity]()
+        outstanding: dict[ExpertIdentity, _Transfer] = {}
+        self.metrics["demand_batches"] += 1
         try:
             for identity in requested:
                 self.metrics["demand_accesses"] += 1
@@ -303,38 +337,80 @@ class DeadlineExpertScheduler:
                     continue
                 self._queued.pop(identity, None)
                 transfer = self._transfers.get(identity)
-                if transfer is None:
-                    while len(self._transfers) >= self._io_depth:
-                        oldest = min(
-                            self._transfers.values(),
-                            key=lambda item: item.submitted_ns,
-                        )
-                        oldest.future.result()
-                        self.poll()
-                    transfer = self._start(identity, demand=True, deadline_ns=None)
-                else:
+                if transfer is not None:
                     transfer.demand = True
                     self.metrics["reads_deduplicated"] += 1
-                if transfer is not None:
+                    outstanding[identity] = transfer
+                else:
+                    missing.append(identity)
+
+            batch_misses = len(missing) + len(outstanding)
+            self.metrics["demand_batch_misses"] += batch_misses
+            self.metrics["max_demand_batch_misses"] = max(
+                self.metrics["max_demand_batch_misses"], batch_misses
+            )
+
+            # Fill the configured storage queue before waiting.  The previous
+            # implementation waited after every submit, reducing the demanded
+            # path to effective QD=1 even when multiple experts in one routed
+            # layer were cold.  Publishing and pinning remain owner-thread
+            # operations, so batching I/O does not weaken slot lifetime rules.
+            while missing or outstanding:
+                while missing and len(self._transfers) < self._io_depth:
+                    identity = missing.popleft()
+                    transfer = self._start(identity, demand=True, deadline_ns=None)
+                    if transfer is not None:
+                        outstanding[identity] = transfer
+
+                if not outstanding:
+                    # The queue can be occupied entirely by unrelated
+                    # prefetches.  Complete the oldest one without pumping more
+                    # speculative work, then admit demanded experts first.
+                    identity, transfer = min(
+                        self._transfers.items(),
+                        key=lambda item: item[1].submitted_ns,
+                    )
                     try:
-                        transfer.future.result()
-                        if transfer.publication is None:
-                            self._begin_publication(transfer)
-                        assert transfer.publication is not None
-                        transfer.publication.wait()
-                        self._finalize(identity, transfer)
+                        self._wait_and_publish(identity, transfer, discard_expired=True)
                     except BaseException:
                         if identity in self._transfers:
                             self._abort_transfer(identity, transfer)
                         raise
+                    continue
+
+                identity, transfer = min(
+                    outstanding.items(),
+                    key=lambda item: item[1].submitted_ns,
+                )
+                try:
+                    self._wait_and_publish(identity, transfer)
+                except BaseException:
+                    if identity in self._transfers:
+                        self._abort_transfer(identity, transfer)
+                    raise
+                del outstanding[identity]
                 lease = self._cache.pin(identity)
                 if lease is None:
                     raise RuntimeError("demanded expert was not published")
                 leases.append(lease)
+
+            self._pump()
             return leases
         except BaseException:
             for lease in leases:
                 self._cache.unpin(lease)
+            # Keep unrelated prefetches alive, but ensure every demanded read
+            # already submitted by this batch is drained or failed so staging
+            # buffers and LOADING slots cannot leak into the next request.
+            for identity, transfer in list(outstanding.items()):
+                if identity not in self._transfers:
+                    continue
+                try:
+                    self._wait_and_publish(identity, transfer)
+                except BaseException:
+                    if identity in self._transfers:
+                        self._abort_transfer(identity, transfer)
+            self._pump()
             raise
 
     def release(self, leases: Iterable[SlotLease]) -> None:

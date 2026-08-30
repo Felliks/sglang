@@ -76,6 +76,51 @@ class Publisher:
         return Publication(record)
 
 
+class TrackingRecord(Record):
+    def __init__(self, identity, storage) -> None:
+        super().__init__(identity)
+        self.storage = storage
+
+    def release(self) -> None:
+        if not self.released:
+            self.storage.inflight -= 1
+        super().release()
+
+
+class TrackingStorage:
+    """Immediately completes reads while retaining records until publication."""
+
+    record_bytes = 6
+
+    def __init__(self) -> None:
+        self.inflight = 0
+        self.max_inflight = 0
+
+    def submit(self, identity):
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        future = Future()
+        future.set_result(TrackingRecord(identity, self))
+        return future
+
+
+class OneFailureTrackingStorage(TrackingStorage):
+    def __init__(self, failed_identity) -> None:
+        super().__init__()
+        self.failed_identity = failed_identity
+
+    def submit(self, identity):
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        future = Future()
+        if identity == self.failed_identity:
+            self.inflight -= 1
+            future.set_exception(OSError("batched read failed"))
+        else:
+            future.set_result(TrackingRecord(identity, self))
+        return future
+
+
 def _scheduler(capacity=2, io_depth=2):
     clock = Clock()
     storage = Storage()
@@ -156,3 +201,51 @@ def test_failed_demand_releases_loading_slot_for_retry() -> None:
 
     scheduler.prefetch([PrefetchCandidate(replacement, 1.0, 1000)])
     assert replacement in storage.futures
+
+
+def test_demand_fills_io_queue_before_waiting_for_publication() -> None:
+    cache = BoundedExpertCache(4)
+    storage = TrackingStorage()
+    scheduler = DeadlineExpertScheduler(
+        cache=cache,
+        storage=storage,
+        publisher=Publisher(),
+        io_depth=2,
+        initial_service_ns=100,
+    )
+    identities = [ExpertIdentity(0, expert_id) for expert_id in range(4)]
+
+    leases = scheduler.demand(identities)
+
+    assert storage.max_inflight == 2
+    assert storage.inflight == 0
+    assert len(leases) == 4
+    assert scheduler.metrics["demand_batches"] == 1
+    assert scheduler.metrics["demand_batch_misses"] == 4
+    assert scheduler.metrics["max_demand_batch_misses"] == 4
+    scheduler.release(leases)
+
+
+def test_failed_batched_demand_releases_completed_leases_and_loading_slots() -> None:
+    identities = [ExpertIdentity(0, expert_id) for expert_id in range(2)]
+    cache = BoundedExpertCache(2)
+    storage = OneFailureTrackingStorage(identities[1])
+    scheduler = DeadlineExpertScheduler(
+        cache=cache,
+        storage=storage,
+        publisher=Publisher(),
+        io_depth=2,
+        initial_service_ns=100,
+    )
+
+    try:
+        scheduler.demand(identities)
+    except OSError as error:
+        assert str(error) == "batched read failed"
+    else:
+        raise AssertionError("failed batched storage read did not propagate")
+
+    assert storage.max_inflight == 2
+    assert storage.inflight == 0
+    assert all(slot["pins"] == 0 for slot in cache.snapshot())
+    assert all(slot["state"] != "loading" for slot in cache.snapshot())
