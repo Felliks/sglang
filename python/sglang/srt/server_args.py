@@ -3037,6 +3037,11 @@ class ServerArgs:
         "Path to the versioned expert cold-store manifest or directory.",
         NS("exec.offload"),
     ] = None
+    expert_seed_path: A[
+        Optional[str],
+        "Optional JSON hot-set seed, indexed by local MoE layer.",
+        NS("exec.offload"),
+    ] = None
     expert_prefetch_layer_horizon: A[
         int,
         "Number of target MoE layers between prediction and use.",
@@ -3057,6 +3062,21 @@ class ServerArgs:
         "Hard GiB budget for expert I/O and transfer staging in flight.",
         NS("exec.offload"),
     ] = 0.25
+    expert_prefetch_initial_latency_ms: A[
+        float,
+        "Initial expected cold-record service latency in milliseconds.",
+        NS("exec.offload"),
+    ] = 1.2
+    expert_prefetch_layer_ms: A[
+        float,
+        "Expected compute lead per cross-layer expert prediction in milliseconds.",
+        NS("exec.offload"),
+    ] = 1.267
+    expert_verify_store_checksums: A[
+        bool,
+        "Verify each cold expert SHA-256 on the read path (canary/debug only).",
+        NS("exec.offload"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # LMCache
@@ -3866,10 +3886,17 @@ class ServerArgs:
                 if self.expert_storage_path is not None
                 else None
             ),
+            seed_path=(
+                Path(self.expert_seed_path)
+                if self.expert_seed_path is not None
+                else None
+            ),
             io_depth=self.expert_prefetch_io_depth,
             prefetch_layer_horizon=self.expert_prefetch_layer_horizon,
             prefetch_candidates=self.expert_prefetch_candidates,
             max_inflight_gib=self.expert_prefetch_max_inflight_gib,
+            initial_latency_ms=self.expert_prefetch_initial_latency_ms,
+            layer_ms=self.expert_prefetch_layer_ms,
         )
 
     def _handle_moe_runner_backend_alias(self):

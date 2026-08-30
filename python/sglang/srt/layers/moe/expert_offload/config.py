@@ -12,10 +12,13 @@ class ExpertOffloadConfig:
     resident_ratio: float | None = None
     resident_gib: float | None = None
     storage_path: Path | None = None
+    seed_path: Path | None = None
     io_depth: int = 2
     prefetch_layer_horizon: int = 1
     prefetch_candidates: int = 0
     max_inflight_gib: float = 0.25
+    initial_latency_ms: float = 1.2
+    layer_ms: float = 1.267
 
     def __post_init__(self) -> None:
         if self.backend not in {"none", "memory", "nvme"}:
@@ -34,6 +37,8 @@ class ExpertOffloadConfig:
             raise ValueError("prefetch_candidates cannot be negative")
         if self.max_inflight_gib <= 0:
             raise ValueError("max_inflight_gib must be positive")
+        if self.initial_latency_ms <= 0 or self.layer_ms <= 0:
+            raise ValueError("expert latency estimates must be positive")
         if self.backend == "none":
             return
         if self.resident_ratio is None and self.resident_gib is None:

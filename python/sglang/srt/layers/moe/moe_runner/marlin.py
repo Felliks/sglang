@@ -146,7 +146,9 @@ def fused_experts_none_to_marlin(
     if quant_info.expert_offload is not None:
         if quant_info.expert_map is not None:
             raise RuntimeError("expert offload cannot be combined with EP mapping yet")
-        prepared_experts = quant_info.expert_offload.prepare(topk_output.topk_ids)
+        prepared_experts = quant_info.expert_offload.prepare(
+            topk_output.topk_ids, hidden_states=hidden_states
+        )
         resident = prepared_experts.tensors
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=resident.w13_qweight,

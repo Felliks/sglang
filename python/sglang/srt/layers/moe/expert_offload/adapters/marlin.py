@@ -187,7 +187,12 @@ class MarlinExpertOffloadAdapter:
             expert_id,
         )
 
-    def prepare(self, topk_ids: torch.Tensor) -> PreparedMarlinExperts:
+    def prepare(
+        self,
+        topk_ids: torch.Tensor,
+        *,
+        hidden_states: torch.Tensor | None = None,
+    ) -> PreparedMarlinExperts:
         with self._lock:
             self._check_stream()
             self._reap_completed()

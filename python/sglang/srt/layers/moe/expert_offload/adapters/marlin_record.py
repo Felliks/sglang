@@ -116,7 +116,9 @@ class MarlinRecordPublisher:
                 raise ValueError(f"dtype mismatch for tensor segment {segment.name}")
             if not row.is_contiguous():
                 raise ValueError(f"destination row is not contiguous: {segment.name}")
-            destination_bytes = row.view(torch.uint8).reshape(-1)
+            # Reshape first: PyTorch rejects dtype-changing view() on a scalar,
+            # while ModelOpt stores per-expert global FP4 scales as scalars.
+            destination_bytes = row.reshape(-1).view(torch.uint8)
             if destination_bytes.numel() != segment.nbytes:
                 raise ValueError(
                     f"byte-size mismatch for tensor segment {segment.name}"

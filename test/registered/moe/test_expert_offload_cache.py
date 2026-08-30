@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import pytest
-from sglang.srt.layers.moe.expert_offload.cache import BoundedExpertCache
+from sglang.srt.layers.moe.expert_offload.cache import (
+    BoundedExpertCache,
+    PartitionedExpertCache,
+)
 from sglang.srt.layers.moe.expert_offload.config import ExpertOffloadConfig
 from sglang.srt.layers.moe.expert_offload.interfaces import (
     AdmissionKind,
@@ -82,3 +85,18 @@ def test_config_rejects_ambiguous_or_unbounded_storage() -> None:
 
     config = ExpertOffloadConfig(backend="memory", resident_ratio=0.625)
     assert config.io_depth == 2
+
+
+def test_partitioned_cache_reuses_local_slot_ids_without_collision() -> None:
+    cache = PartitionedExpertCache(partitions=2, capacity_per_partition=1)
+    first = cache.admit(ExpertIdentity(0, 7))
+    second = cache.admit(ExpertIdentity(1, 9))
+    cache.publish(first)
+    cache.publish(second)
+
+    assert first.slot_id == second.slot_id == 0
+    first_lease = cache.pin(first.identity)
+    second_lease = cache.pin(second.identity)
+    assert first_lease.slot_id == second_lease.slot_id == 0
+    cache.unpin(first_lease)
+    cache.unpin(second_lease)

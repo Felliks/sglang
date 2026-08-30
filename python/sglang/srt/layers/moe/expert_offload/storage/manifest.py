@@ -22,7 +22,7 @@ class TensorSegment:
             raise ValueError("tensor segment name cannot be empty")
         if self.offset < 0 or self.nbytes <= 0:
             raise ValueError("tensor segment offset/size is invalid")
-        if not self.dtype or not self.shape or any(size <= 0 for size in self.shape):
+        if not self.dtype or any(size <= 0 for size in self.shape):
             raise ValueError("tensor segment dtype/shape is invalid")
 
 

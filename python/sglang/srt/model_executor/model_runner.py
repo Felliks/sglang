@@ -1116,6 +1116,25 @@ class ModelRunner:
                 loaded.remote_instance_weight_info
             )
 
+        self.expert_offload_coordinator = None
+        if self.server_args.expert_offload_backend != "none":
+            if self.startup_weight_load is not None:
+                raise ValueError(
+                    "expert offload is not compatible with startup weight-load overlap"
+                )
+            from sglang.srt.layers.moe.expert_offload.runtime import (
+                install_expert_offload,
+            )
+
+            self.expert_offload_coordinator = install_expert_offload(
+                model=self.model,
+                server_args=self.server_args,
+                model_path=self.model_config.model_path,
+                is_draft_worker=self.is_draft_worker,
+                tp_rank=self.ps.tp_rank,
+                pp_rank=self.ps.pp_rank,
+            )
+
         if not self.is_draft_worker:
             get_offloader().post_init()
 

@@ -181,7 +181,7 @@ def _copy_marlin_expert_to_record(
     device = tensors.w13_qweight.device
     for segment in segments:
         row = getattr(tensors, segment.name)[expert_id]
-        source_bytes = row.contiguous().view(torch.uint8).reshape(-1)
+        source_bytes = row.contiguous().reshape(-1).view(torch.uint8)
         if source_bytes.numel() != segment.nbytes:
             raise ValueError(f"Marlin record byte-size changed: {segment.name}")
         destination_bytes = torch.frombuffer(

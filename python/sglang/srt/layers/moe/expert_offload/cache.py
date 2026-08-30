@@ -190,3 +190,49 @@ class BoundedExpertCache:
                 }
                 for slot in self._slots
             ]
+
+
+class PartitionedExpertCache:
+    """Independent physical slot namespaces behind one scheduler contract."""
+
+    def __init__(self, partitions: int, capacity_per_partition: int) -> None:
+        if partitions <= 0:
+            raise ValueError("partitions must be positive")
+        self._partitions = [
+            BoundedExpertCache(capacity_per_partition) for _ in range(partitions)
+        ]
+
+    def _cache(self, identity: ExpertIdentity) -> BoundedExpertCache:
+        if not 0 <= identity.layer_id < len(self._partitions):
+            raise ValueError(
+                f"expert partition is outside the cache: {identity.layer_id}"
+            )
+        return self._partitions[identity.layer_id]
+
+    def admit(
+        self,
+        identity: ExpertIdentity,
+        *,
+        protected: frozenset[ExpertIdentity] = frozenset(),
+    ) -> Admission:
+        local_protected = frozenset(
+            item for item in protected if item.layer_id == identity.layer_id
+        )
+        return self._cache(identity).admit(identity, protected=local_protected)
+
+    def publish(self, admission: Admission) -> None:
+        self._cache(admission.identity).publish(admission)
+
+    def fail(self, admission: Admission) -> None:
+        self._cache(admission.identity).fail(admission)
+
+    def pin(self, identity: ExpertIdentity) -> SlotLease | None:
+        return self._cache(identity).pin(identity)
+
+    def unpin(self, lease: SlotLease) -> None:
+        self._cache(lease.identity).unpin(lease)
+
+    def snapshot(self, partition: int) -> list[dict[str, object]]:
+        if not 0 <= partition < len(self._partitions):
+            raise ValueError(f"cache partition is outside the cache: {partition}")
+        return self._partitions[partition].snapshot()
