@@ -150,6 +150,21 @@ def fused_experts_none_to_marlin(
             topk_output.topk_ids, hidden_states=hidden_states
         )
         resident = prepared_experts.tensors
+        # Marlin's ``expert_map`` flag only selects its EP masking path; the
+        # fused kernel does not consume arbitrary map values and therefore
+        # cannot translate a global expert id into a cache slot.  Translate
+        # the demanded ids explicitly before alignment so every kernel index
+        # is within the reduced resident tensor's first dimension.
+        mapped_topk_ids = prepared_experts.expert_map[topk_output.topk_ids]
+        if torch.any(mapped_topk_ids < 0):
+            raise RuntimeError("expert offload left a demanded Marlin expert absent")
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_output.topk_weights,
+            topk_ids=mapped_topk_ids,
+            router_logits=topk_output.router_logits,
+        )
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=resident.w13_qweight,
             w2_qweight=resident.w2_qweight,
@@ -163,8 +178,8 @@ def fused_experts_none_to_marlin(
             is_k_full=quant_info.is_k_full,
             w13_qzeros=quant_info.w13_qzeros,
             w2_qzeros=quant_info.w2_qzeros,
-            expert_map=prepared_experts.expert_map,
-            global_num_experts=prepared_experts.global_num_experts,
+            expert_map=None,
+            global_num_experts=-1,
             w13_global_scale=resident.w13_global_scale,
             w2_global_scale=resident.w2_global_scale,
             w13_bias=quant_info.w13_bias,
