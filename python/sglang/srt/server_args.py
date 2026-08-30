@@ -3037,6 +3037,19 @@ class ServerArgs:
         "Path to the versioned expert cold-store manifest or directory.",
         NS("exec.offload"),
     ] = None
+    expert_storage_engine: A[
+        str,
+        Arg(
+            help="NVMe expert read engine.",
+            choices=["pread", "io_uring", "auto"],
+        ),
+        NS("exec.offload"),
+    ] = "pread"
+    expert_io_uring_library: A[
+        Optional[str],
+        "Optional path to libsglang_expert_io_uring.",
+        NS("exec.offload"),
+    ] = None
     expert_seed_path: A[
         Optional[str],
         "Optional JSON hot-set seed, indexed by local MoE layer.",
@@ -3889,6 +3902,12 @@ class ServerArgs:
             seed_path=(
                 Path(self.expert_seed_path)
                 if self.expert_seed_path is not None
+                else None
+            ),
+            storage_engine=self.expert_storage_engine,
+            io_uring_library=(
+                Path(self.expert_io_uring_library)
+                if self.expert_io_uring_library is not None
                 else None
             ),
             io_depth=self.expert_prefetch_io_depth,

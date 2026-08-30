@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +34,9 @@ from sglang.srt.layers.moe.expert_offload.storage.cuda_host import (
 from sglang.srt.layers.moe.expert_offload.storage.manifest import ExpertStoreManifest
 from sglang.srt.layers.moe.expert_offload.storage.nvme_direct import (
     DirectExpertStorage,
+)
+from sglang.srt.layers.moe.expert_offload.storage.nvme_uring import (
+    IoUringExpertStorage,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -314,13 +318,34 @@ def install_expert_offload(
         expert_maps.append(expert_map)
         publishers.append(BoundMarlinRecordPublisher(resident, segments))
 
-    storage = DirectExpertStorage(
-        manifest_path,
-        io_depth=server_args.expert_prefetch_io_depth,
-        direct=True,
-        verify_checksums=server_args.expert_verify_store_checksums,
-        buffer_registrar=CudaHostRegistration,
-    )
+    storage_engine = server_args.expert_storage_engine
+    if storage_engine == "auto":
+        storage_engine = (
+            "io_uring"
+            if server_args.expert_io_uring_library is not None
+            or os.environ.get("SGLANG_EXPERT_IO_URING_LIBRARY")
+            else "pread"
+        )
+    if storage_engine == "io_uring":
+        storage = IoUringExpertStorage(
+            manifest_path,
+            io_depth=server_args.expert_prefetch_io_depth,
+            verify_checksums=server_args.expert_verify_store_checksums,
+            buffer_registrar=CudaHostRegistration,
+            library_path=(
+                Path(server_args.expert_io_uring_library)
+                if server_args.expert_io_uring_library is not None
+                else None
+            ),
+        )
+    else:
+        storage = DirectExpertStorage(
+            manifest_path,
+            io_depth=server_args.expert_prefetch_io_depth,
+            direct=True,
+            verify_checksums=server_args.expert_verify_store_checksums,
+            buffer_registrar=CudaHostRegistration,
+        )
 
     def on_evict(identity: ExpertIdentity) -> None:
         expert_maps[identity.layer_id][identity.expert_id] = -1
@@ -367,12 +392,14 @@ def install_expert_offload(
     torch.cuda.empty_cache()
     logger.info(
         "Expert offload installed: layers=%d experts=%d resident_per_layer=%d "
-        "resident_ratio=%.4f record_bytes=%d io_depth=%d horizon=%d candidates=%d",
+        "resident_ratio=%.4f record_bytes=%d storage_engine=%s io_depth=%d "
+        "horizon=%d candidates=%d",
         manifest.num_layers,
         experts,
         capacity,
         capacity / experts,
         manifest.record_bytes,
+        storage_engine,
         server_args.expert_prefetch_io_depth,
         horizon,
         server_args.expert_prefetch_candidates,
