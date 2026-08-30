@@ -2745,6 +2745,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_global_scale=layer.w2_weight_scale_2,
             expert_map=expert_map,
             global_num_experts=global_num_experts,
+            expert_offload=getattr(layer, "expert_offload", None),
         )
 
     def apply(

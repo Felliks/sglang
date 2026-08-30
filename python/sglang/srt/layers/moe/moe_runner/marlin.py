@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -17,6 +16,9 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.expert_offload.adapters.marlin import (
+        MarlinExpertOffloadAdapter,
+    )
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -110,6 +112,7 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w2_global_scale: Optional[torch.Tensor] = None
     w13_bias: Optional[torch.Tensor] = None
     w2_bias: Optional[torch.Tensor] = None
+    expert_offload: Optional[MarlinExpertOffloadAdapter] = None
 
 
 @register_fused_func("none", "marlin")
@@ -137,6 +140,33 @@ def fused_experts_none_to_marlin(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             router_logits=topk_output.router_logits,
+        )
+
+    prepared_experts = None
+    if quant_info.expert_offload is not None:
+        if quant_info.expert_map is not None:
+            raise RuntimeError("expert offload cannot be combined with EP mapping yet")
+        prepared_experts = quant_info.expert_offload.prepare(topk_output.topk_ids)
+        resident = prepared_experts.tensors
+        quant_info = MarlinMoeQuantInfo(
+            w13_qweight=resident.w13_qweight,
+            w2_qweight=resident.w2_qweight,
+            w13_scales=resident.w13_scales,
+            w2_scales=resident.w2_scales,
+            w13_g_idx_sort_indices=quant_info.w13_g_idx_sort_indices,
+            w2_g_idx_sort_indices=quant_info.w2_g_idx_sort_indices,
+            weight_bits=quant_info.weight_bits,
+            w13_g_idx=quant_info.w13_g_idx,
+            w2_g_idx=quant_info.w2_g_idx,
+            is_k_full=quant_info.is_k_full,
+            w13_qzeros=quant_info.w13_qzeros,
+            w2_qzeros=quant_info.w2_qzeros,
+            expert_map=prepared_experts.expert_map,
+            global_num_experts=prepared_experts.global_num_experts,
+            w13_global_scale=resident.w13_global_scale,
+            w2_global_scale=resident.w2_global_scale,
+            w13_bias=quant_info.w13_bias,
+            w2_bias=quant_info.w2_bias,
         )
 
     if runner_config.is_gated:
@@ -171,41 +201,45 @@ def fused_experts_none_to_marlin(
         marlin_hidden_states = hidden_states.to(torch.bfloat16)
         marlin_inplace = False
 
-    output = fused_marlin_moe(
-        hidden_states=marlin_hidden_states,
-        w1=quant_info.w13_qweight,
-        w2=quant_info.w2_qweight,
-        w1_scale=quant_info.w13_scales,
-        w2_scale=quant_info.w2_scales,
-        gating_output=topk_output.router_logits,
-        topk_weights=topk_output.topk_weights,
-        topk_ids=topk_output.topk_ids,
-        global_num_experts=quant_info.global_num_experts,
-        expert_map=quant_info.expert_map,
-        g_idx1=quant_info.w13_g_idx,
-        g_idx2=quant_info.w2_g_idx,
-        sort_indices1=quant_info.w13_g_idx_sort_indices,
-        sort_indices2=quant_info.w2_g_idx_sort_indices,
-        w1_zeros=quant_info.w13_qzeros,
-        w2_zeros=quant_info.w2_qzeros,
-        w1_global_scale=quant_info.w13_global_scale,
-        w2_global_scale=quant_info.w2_global_scale,
-        w1_bias=quant_info.w13_bias,
-        w2_bias=quant_info.w2_bias,
-        workspace=workspace,
-        num_bits=quant_info.weight_bits,
-        is_k_full=quant_info.is_k_full,
-        inplace=marlin_inplace,
-        routed_scaling_factor=runner_config.routed_scaling_factor,
-        clamp_limit=(
-            runner_config.gemm1_clamp_limit
-            if runner_config.gemm1_alpha is not None
-            else runner_config.swiglu_limit
-        ),
-        gemm1_alpha=runner_config.gemm1_alpha,
-        activation=runner_config.activation,
-        is_gated=runner_config.is_gated,
-    ).to(hidden_states.dtype)
+    try:
+        output = fused_marlin_moe(
+            hidden_states=marlin_hidden_states,
+            w1=quant_info.w13_qweight,
+            w2=quant_info.w2_qweight,
+            w1_scale=quant_info.w13_scales,
+            w2_scale=quant_info.w2_scales,
+            gating_output=topk_output.router_logits,
+            topk_weights=topk_output.topk_weights,
+            topk_ids=topk_output.topk_ids,
+            global_num_experts=quant_info.global_num_experts,
+            expert_map=quant_info.expert_map,
+            g_idx1=quant_info.w13_g_idx,
+            g_idx2=quant_info.w2_g_idx,
+            sort_indices1=quant_info.w13_g_idx_sort_indices,
+            sort_indices2=quant_info.w2_g_idx_sort_indices,
+            w1_zeros=quant_info.w13_qzeros,
+            w2_zeros=quant_info.w2_qzeros,
+            w1_global_scale=quant_info.w13_global_scale,
+            w2_global_scale=quant_info.w2_global_scale,
+            w1_bias=quant_info.w13_bias,
+            w2_bias=quant_info.w2_bias,
+            workspace=workspace,
+            num_bits=quant_info.weight_bits,
+            is_k_full=quant_info.is_k_full,
+            inplace=marlin_inplace,
+            routed_scaling_factor=runner_config.routed_scaling_factor,
+            clamp_limit=(
+                runner_config.gemm1_clamp_limit
+                if runner_config.gemm1_alpha is not None
+                else runner_config.swiglu_limit
+            ),
+            gemm1_alpha=runner_config.gemm1_alpha,
+            activation=runner_config.activation,
+            is_gated=runner_config.is_gated,
+        ).to(hidden_states.dtype)
+    finally:
+        if prepared_experts is not None:
+            prepared_experts.record_completion()
 
     return StandardCombineInput(
         hidden_states=output,

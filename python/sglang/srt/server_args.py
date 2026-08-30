@@ -3014,6 +3014,49 @@ class ServerArgs:
         int, "Steps to prefetch in offloading.", NS("exec.offload")
     ] = 1
     offload_mode: A[str, "Mode of offloading.", NS("exec.offload")] = "cpu"
+    expert_offload_backend: A[
+        str,
+        Arg(
+            help="Bounded MoE expert-weight storage backend.",
+            choices=["none", "memory", "nvme"],
+        ),
+        NS("exec.offload"),
+    ] = "none"
+    expert_resident_ratio: A[
+        Optional[float],
+        "Fraction of each layer's routed experts kept in resident slots.",
+        NS("exec.offload"),
+    ] = None
+    expert_resident_gib: A[
+        Optional[float],
+        "Total resident expert-weight budget in GiB.",
+        NS("exec.offload"),
+    ] = None
+    expert_storage_path: A[
+        Optional[str],
+        "Path to the versioned expert cold-store manifest or directory.",
+        NS("exec.offload"),
+    ] = None
+    expert_prefetch_layer_horizon: A[
+        int,
+        "Number of target MoE layers between prediction and use.",
+        NS("exec.offload"),
+    ] = 1
+    expert_prefetch_candidates: A[
+        int,
+        "Maximum expert prefetch candidates admitted per target layer.",
+        NS("exec.offload"),
+    ] = 0
+    expert_prefetch_io_depth: A[
+        int,
+        "Maximum concurrent expert cold-store reads.",
+        NS("exec.offload"),
+    ] = 2
+    expert_prefetch_max_inflight_gib: A[
+        float,
+        "Hard GiB budget for expert I/O and transfer staging in flight.",
+        NS("exec.offload"),
+    ] = 0.25
 
     # -------------------------------------------------------------------------
     # LMCache
@@ -3809,6 +3852,25 @@ class ServerArgs:
                 "--cpu-offload-gb or --offload-group-size: generic layer offload "
                 "would stage the pinned PLE embedding back to the device."
             )
+
+        from pathlib import Path
+
+        from sglang.srt.layers.moe.expert_offload.config import ExpertOffloadConfig
+
+        ExpertOffloadConfig(
+            backend=self.expert_offload_backend,
+            resident_ratio=self.expert_resident_ratio,
+            resident_gib=self.expert_resident_gib,
+            storage_path=(
+                Path(self.expert_storage_path)
+                if self.expert_storage_path is not None
+                else None
+            ),
+            io_depth=self.expert_prefetch_io_depth,
+            prefetch_layer_horizon=self.expert_prefetch_layer_horizon,
+            prefetch_candidates=self.expert_prefetch_candidates,
+            max_inflight_gib=self.expert_prefetch_max_inflight_gib,
+        )
 
     def _handle_moe_runner_backend_alias(self):
         if self.moe_runner_backend != "megamoe":
