@@ -112,7 +112,12 @@ class ExpertDistributionRecorder(ABC):
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield {}
 
-    def on_select_experts(self, topk_ids: torch.Tensor):
+    def on_select_experts(
+        self,
+        topk_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None,
+        router_logits: Optional[torch.Tensor] = None,
+    ):
         pass
 
     def on_deepep_dispatch_normal(
@@ -224,8 +229,16 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
 
-    def on_select_experts(self, topk_ids: torch.Tensor):
-        self._on_hook("on_select_experts", topk_ids=topk_ids)
+    def on_select_experts(
+        self,
+        topk_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None,
+        router_logits: Optional[torch.Tensor] = None,
+    ):
+        kwargs = dict(topk_ids=topk_ids)
+        if self._server_args.expert_distribution_recorder_capture_router_inputs:
+            kwargs.update(hidden_states=hidden_states, router_logits=router_logits)
+        self._on_hook("on_select_experts", **kwargs)
 
     def on_deepep_dispatch_normal(
         self,
@@ -393,9 +406,6 @@ class _SinglePassGatherer(ABC):
 
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
-    # DeepSeek V3 has this value; should generalize later
-    _TOP_K_NUM = 8
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -403,17 +413,45 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         rank: int,
     ):
         super().__init__(expert_location_metadata, rank)
+        model_config = server_args.get_model_config()
+        text_config = model_config.hf_text_config
+        top_k_num = text_config.num_experts_per_tok
         self._metadata: Optional[Dict[str, Any]] = None
         self._topk_ids_of_layer = torch.zeros(
             (
                 expert_location_metadata.num_layers,
                 # TODO determine the max number
                 get_schedule().chunked_prefill_size * 8,
-                self._TOP_K_NUM,
+                top_k_num,
             ),
             dtype=torch.int32,
             device=server_args.device,
         )
+        self._capture_router_inputs = (
+            server_args.expert_distribution_recorder_capture_router_inputs
+        )
+        self._max_router_input_tokens = (
+            server_args.expert_distribution_recorder_max_router_input_tokens_per_pass
+        )
+        if self._capture_router_inputs:
+            self._router_inputs_of_layer = torch.empty(
+                (
+                    expert_location_metadata.num_layers,
+                    self._max_router_input_tokens,
+                    text_config.hidden_size,
+                ),
+                dtype=model_config.dtype,
+                device=server_args.device,
+            )
+            self._router_logits_of_layer = torch.empty(
+                (
+                    expert_location_metadata.num_layers,
+                    self._max_router_input_tokens,
+                    expert_location_metadata.num_logical_experts,
+                ),
+                dtype=model_config.dtype,
+                device=server_args.device,
+            )
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
             not server_args.enable_two_batch_overlap
@@ -422,18 +460,53 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
+        num_tokens = len(forward_batch.input_ids)
+        num_router_input_tokens = min(num_tokens, self._max_router_input_tokens)
         self._metadata = dict(
-            # TODO pr-chain
-            # rids=forward_batch.rids,
+            rids=(list(forward_batch.rids) if forward_batch.rids is not None else None),
+            batch_size=forward_batch.batch_size,
             input_ids=forward_batch.input_ids.cpu().tolist(),
             positions=forward_batch.positions.cpu().tolist(),
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
             forward_mode=forward_batch.forward_mode.value,
+            router_input_token_indices=list(
+                range(num_tokens - num_router_input_tokens, num_tokens)
+            ),
         )
 
-    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+    def on_select_experts(
+        self,
+        layer_idx: int,
+        topk_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None,
+        router_logits: Optional[torch.Tensor] = None,
+    ):
+        if topk_ids.shape[0] > self._topk_ids_of_layer.shape[1]:
+            raise RuntimeError(
+                "Expert distribution trace exceeded its per-pass token buffer: "
+                f"{topk_ids.shape[0]} > {self._topk_ids_of_layer.shape[1]}"
+            )
         self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
             topk_ids
+        )
+        if not self._capture_router_inputs:
+            return
+        if hidden_states is None or router_logits is None:
+            raise RuntimeError(
+                "Router-input capture requires hidden_states and router_logits"
+            )
+        num_tokens = len(self._metadata["input_ids"])
+        num_captured = min(
+            num_tokens,
+            hidden_states.shape[0],
+            router_logits.shape[0],
+            self._max_router_input_tokens,
+        )
+        self._router_inputs_of_layer[layer_idx, :num_captured].copy_(
+            hidden_states[num_tokens - num_captured : num_tokens]
+        )
+        self._router_logits_of_layer[layer_idx, :num_captured].copy_(
+            router_logits[num_tokens - num_captured : num_tokens]
         )
 
     def on_deepep_dispatch_normal(
@@ -464,6 +537,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def collect(self) -> Dict:
         num_tokens = len(self._metadata["input_ids"])
+        num_router_input_tokens = len(self._metadata["router_input_token_indices"])
 
         global_physical_count = _convert_per_token_to_global_physical_count(
             num_tokens,
@@ -472,12 +546,26 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             _topk_ids_of_layer=self._topk_ids_of_layer,
         )
 
-        return dict(
+        output = dict(
             **self._metadata,
             topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
             misc_objects=self._misc_objects,
             global_physical_count=global_physical_count,
         )
+        if self._capture_router_inputs:
+            output.update(
+                router_inputs_of_layer=self._router_inputs_of_layer[
+                    :, :num_router_input_tokens
+                ]
+                .clone()
+                .cpu(),
+                router_logits_of_layer=self._router_logits_of_layer[
+                    :, :num_router_input_tokens
+                ]
+                .clone()
+                .cpu(),
+            )
+        return output
 
 
 class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
@@ -836,7 +924,9 @@ class _DequeCollection:
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._records = []
+        buffer_size = self._server_args.expert_distribution_recorder_buffer_size
+        self._records = deque(maxlen=None if buffer_size == -1 else buffer_size)
+        self._total_records = 0
 
     def get_single_pass_gatherer_keys(self):
         return super().get_single_pass_gatherer_keys()
@@ -870,15 +960,30 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
                 **single_pass_data_processed,
             )
         )
+        self._total_records += 1
 
     def reset(self):
         super().reset()
         self._records.clear()
+        self._total_records = 0
 
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
+        text_config = self._server_args.get_model_config().hf_text_config
         output = dict(
-            records=self._records,
+            schema_version=2,
+            trace_metadata=dict(
+                num_layers=self._expert_location_metadata.num_layers,
+                num_logical_experts=self._expert_location_metadata.num_logical_experts,
+                num_experts_per_tok=text_config.num_experts_per_tok,
+                hidden_size=text_config.hidden_size,
+                capture_router_inputs=self._server_args.expert_distribution_recorder_capture_router_inputs,
+                max_router_input_tokens_per_pass=self._server_args.expert_distribution_recorder_max_router_input_tokens_per_pass,
+                buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+                total_records=self._total_records,
+                dropped_records=max(0, self._total_records - len(self._records)),
+            ),
+            records=list(self._records),
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )

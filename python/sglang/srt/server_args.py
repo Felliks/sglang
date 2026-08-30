@@ -2415,6 +2415,16 @@ class ServerArgs:
         "Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
         NS("exec.moe"),
     ] = None
+    expert_distribution_recorder_capture_router_inputs: A[
+        bool,
+        "Capture bounded router inputs and logits in per-token expert distribution traces.",
+        NS("exec.moe"),
+    ] = False
+    expert_distribution_recorder_max_router_input_tokens_per_pass: A[
+        int,
+        "Maximum number of trailing router-input tokens captured per forward pass.",
+        NS("exec.moe"),
+    ] = 1
     expert_balancedness_report_mode: A[
         Literal["off", "server_log", "prometheus", "both"],
         "Where to report expert balancedness. Options: off, server_log, prometheus, both.",
@@ -7262,6 +7272,18 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
+
+        if self.expert_distribution_recorder_capture_router_inputs:
+            if self.expert_distribution_recorder_mode != "per_token":
+                raise ValueError(
+                    "--expert-distribution-recorder-capture-router-inputs "
+                    "requires --expert-distribution-recorder-mode per_token"
+                )
+            if self.expert_distribution_recorder_max_router_input_tokens_per_pass < 1:
+                raise ValueError(
+                    "--expert-distribution-recorder-max-router-input-tokens-per-pass "
+                    "must be at least 1"
+                )
 
     def _handle_pipeline_parallelism(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:

@@ -2313,7 +2313,9 @@ def select_experts(
     )
 
     get_global_expert_distribution_recorder().on_select_experts(
-        topk_ids=recorder_topk_ids
+        topk_ids=recorder_topk_ids,
+        hidden_states=hidden_states,
+        router_logits=router_logits,
     )
 
     # ===== TO BE REFACTORED ====
