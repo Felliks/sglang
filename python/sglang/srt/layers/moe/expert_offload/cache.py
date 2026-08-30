@@ -202,6 +202,11 @@ class PartitionedExpertCache:
             BoundedExpertCache(capacity_per_partition) for _ in range(partitions)
         ]
 
+    @property
+    def capacity(self) -> int:
+        """Physical expert slots available in each independent partition."""
+        return self._partitions[0].capacity
+
     def _cache(self, identity: ExpertIdentity) -> BoundedExpertCache:
         if not 0 <= identity.layer_id < len(self._partitions):
             raise ValueError(

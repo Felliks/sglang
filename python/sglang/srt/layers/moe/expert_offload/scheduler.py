@@ -96,6 +96,7 @@ class DeadlineExpertScheduler:
             "demand_cache_hits": 0,
             "demand_reads": 0,
             "demand_batches": 0,
+            "max_demand_batch_experts": 0,
             "demand_batch_misses": 0,
             "max_demand_batch_misses": 0,
             "publication_failures": 0,
@@ -323,6 +324,16 @@ class DeadlineExpertScheduler:
     def demand(self, identities: Iterable[ExpertIdentity]) -> list[SlotLease]:
         self._check_thread()
         requested = list(dict.fromkeys(identities))
+        self.metrics["max_demand_batch_experts"] = max(
+            self.metrics["max_demand_batch_experts"], len(requested)
+        )
+        if len(requested) > self._cache.capacity:
+            raise ExpertCacheFullError(
+                "demand batch requires "
+                f"{len(requested)} experts but the partition has only "
+                f"{self._cache.capacity} resident slots; increase the resident "
+                "budget or split the MoE prefill working set"
+            )
         leases: list[SlotLease] = []
         missing = deque[ExpertIdentity]()
         outstanding: dict[ExpertIdentity, _Transfer] = {}

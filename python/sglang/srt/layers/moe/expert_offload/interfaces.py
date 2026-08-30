@@ -76,6 +76,9 @@ class ExpertPublisher(Protocol):
 
 
 class ExpertCacheBackend(Protocol):
+    @property
+    def capacity(self) -> int: ...
+
     def admit(
         self,
         identity: ExpertIdentity,

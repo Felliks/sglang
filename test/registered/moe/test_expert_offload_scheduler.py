@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 
-from sglang.srt.layers.moe.expert_offload.cache import BoundedExpertCache
+from sglang.srt.layers.moe.expert_offload.cache import (
+    BoundedExpertCache,
+    ExpertCacheFullError,
+)
 from sglang.srt.layers.moe.expert_offload.interfaces import ExpertIdentity
 from sglang.srt.layers.moe.expert_offload.scheduler import (
     DeadlineExpertScheduler,
@@ -223,7 +226,31 @@ def test_demand_fills_io_queue_before_waiting_for_publication() -> None:
     assert scheduler.metrics["demand_batches"] == 1
     assert scheduler.metrics["demand_batch_misses"] == 4
     assert scheduler.metrics["max_demand_batch_misses"] == 4
+    assert scheduler.metrics["max_demand_batch_experts"] == 4
     scheduler.release(leases)
+
+
+def test_demand_rejects_oversized_working_set_before_pinning() -> None:
+    cache = BoundedExpertCache(2)
+    scheduler = DeadlineExpertScheduler(
+        cache=cache,
+        storage=TrackingStorage(),
+        publisher=Publisher(),
+        io_depth=2,
+        initial_service_ns=100,
+    )
+    identities = [ExpertIdentity(0, expert_id) for expert_id in range(3)]
+
+    try:
+        scheduler.demand(identities)
+    except ExpertCacheFullError as error:
+        assert "requires 3 experts" in str(error)
+        assert "only 2 resident slots" in str(error)
+    else:
+        raise AssertionError("oversized working set was accepted")
+
+    assert all(slot["pins"] == 0 for slot in cache.snapshot())
+    assert scheduler.metrics["max_demand_batch_experts"] == 3
 
 
 def test_failed_batched_demand_releases_completed_leases_and_loading_slots() -> None:
