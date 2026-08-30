@@ -18,6 +18,10 @@ class SlotState(str, Enum):
     RESIDENT = "resident"
 
 
+class ExpertCacheFullError(RuntimeError):
+    """Every physical slot is pinned, loading, or explicitly protected."""
+
+
 @dataclass
 class _Slot:
     slot_id: int
@@ -96,7 +100,7 @@ class BoundedExpertCache:
                     and slot.identity not in protected
                 ]
                 if not candidates:
-                    raise RuntimeError("no unpinned expert slot is available")
+                    raise ExpertCacheFullError("no unpinned expert slot is available")
                 empty = min(candidates, key=lambda slot: slot.last_access)
 
             evicted = empty.identity

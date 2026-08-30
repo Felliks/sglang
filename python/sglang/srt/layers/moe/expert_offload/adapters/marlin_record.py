@@ -137,3 +137,22 @@ class MarlinRecordPublisher:
         if event is None:
             publication.release_if_ready()
         return publication
+
+
+class BoundMarlinRecordPublisher:
+    """Bind the generic scheduler publisher contract to one layer's slots."""
+
+    def __init__(
+        self,
+        destination: MarlinExpertTensors,
+        segments: tuple[TensorSegment, ...],
+    ) -> None:
+        self.destination = destination
+        self._publisher = MarlinRecordPublisher(segments)
+
+    def publish(
+        self,
+        completed: DirectRead,
+        slot_id: int,
+    ) -> PendingMarlinPublication:
+        return self._publisher.publish(completed, self.destination, slot_id)

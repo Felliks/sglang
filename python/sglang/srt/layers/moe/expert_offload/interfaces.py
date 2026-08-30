@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
@@ -45,6 +46,33 @@ class ExpertStorageBackend(Protocol):
     def record_bytes(self) -> int: ...
 
     def read_into(self, identity: ExpertIdentity, destination: memoryview) -> None: ...
+
+
+class ExpertRecordLease(Protocol):
+    identity: ExpertIdentity
+
+    def view(self) -> memoryview: ...
+
+    def release(self) -> None: ...
+
+
+class AsyncExpertStorageBackend(Protocol):
+    @property
+    def record_bytes(self) -> int: ...
+
+    def submit(self, identity: ExpertIdentity) -> Future[ExpertRecordLease]: ...
+
+
+class ExpertPublication(Protocol):
+    def ready(self) -> bool: ...
+
+    def release_if_ready(self) -> bool: ...
+
+    def wait(self) -> None: ...
+
+
+class ExpertPublisher(Protocol):
+    def publish(self, record: ExpertRecordLease, slot_id: int) -> ExpertPublication: ...
 
 
 class ExpertCacheBackend(Protocol):
