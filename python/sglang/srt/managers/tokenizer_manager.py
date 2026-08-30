@@ -785,6 +785,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         try:
+            dispatched_rids = set()
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
@@ -804,11 +805,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     self._send_one_request(tokenized_obj)
+                    dispatched_rids.add(obj.rid)
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
-                    async for response in self._handle_batch_request(obj, request):
+                    async for response in self._handle_batch_request(
+                        obj, request, dispatched_rids
+                    ):
                         yield response
+        except (asyncio.CancelledError, GeneratorExit):
+            # The response background task runs after both cancellation and
+            # normal completion. Publish scheduler IDs only for cancellation,
+            # so a completed request is never aborted retroactively.
+            obj._dispatched_rids = dispatched_rids.copy()
+            # Keep dispatched states until the scheduler's abort echo removes
+            # them. Pending states that never reached the scheduler can go now.
+            self._discard_pending_req_states(obj, dispatched_rids)
+            raise
         except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
@@ -1834,6 +1847,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        dispatched_rids: Optional[set[str]] = None,
     ):
         batch_size = obj.batch_size
 
@@ -1843,6 +1857,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
                 self._send_batch_request(tokenized_objs)
+                if dispatched_rids is not None:
+                    dispatched_rids.update(
+                        tokenized_obj.rid for tokenized_obj in tokenized_objs
+                    )
 
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
@@ -1868,6 +1886,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
+                        if dispatched_rids is not None:
+                            dispatched_rids.add(tmp_obj.rid)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -1901,6 +1921,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
                 self._send_one_request(tokenized_obj)
+                if dispatched_rids is not None:
+                    dispatched_rids.add(tokenized_obj.rid)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -1921,6 +1943,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
+                    if dispatched_rids is not None:
+                        dispatched_rids.add(tokenized_obj.rid)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
@@ -1980,13 +2004,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, force: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         if (
             not abort_all
+            and not force
             and self.server_args.tokenizer_worker_num == 1
             and rid not in self.rid_to_state
         ):
@@ -2165,7 +2192,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            if obj.is_single:
+            dispatched_rids = getattr(obj, "_dispatched_rids", None)
+            if dispatched_rids is not None:
+                # Cancellation may finish local cleanup before this delayed
+                # task runs, so force scheduler delivery for known live IDs.
+                for rid in dispatched_rids:
+                    self.abort_request(rid, force=True)
+            elif obj.is_single:
                 self.abort_request(obj.rid)
             else:
                 for rid in obj.rid:
@@ -3418,7 +3451,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _discard_pending_req_states(self, obj):
+    def _discard_pending_req_states(self, obj, dispatched_rids=None):
         """Drop rid_to_state entries created by _init_req_state for *obj*.
 
         Safe to call after a partial/failed dispatch: only entries still present
@@ -3430,7 +3463,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            if dispatched_rids is None or rid not in dispatched_rids:
+                self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
