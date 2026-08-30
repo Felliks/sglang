@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -7,6 +8,8 @@ import torch
 from sglang.srt.layers.moe.expert_offload.adapters.marlin import (
     MarlinExpertTensors,
 )
+
+logger = logging.getLogger(__name__)
 from sglang.srt.layers.moe.expert_offload.interfaces import SlotLease
 from sglang.srt.layers.moe.expert_offload.scheduler import (
     DeadlineExpertScheduler,
@@ -62,6 +65,7 @@ class ScheduledMarlinExpertOffload:
         self._pending: list[tuple[torch.cuda.Event, list[SlotLease]]] = []
         self._cuda_stream: int | None = None
         self._owner_thread = threading.get_ident()
+        self._prepare_calls = 0
 
     def _check_context(self) -> None:
         if threading.get_ident() != self._owner_thread:
@@ -126,6 +130,7 @@ class ScheduledMarlinExpertOffload:
         hidden_states: torch.Tensor | None = None,
     ) -> PreparedScheduledMarlinExperts:
         self._check_context()
+        self._prepare_calls += 1
         self._reap_kernel_leases()
         self._scheduler.poll()
         if hidden_states is not None:
@@ -140,6 +145,11 @@ class ScheduledMarlinExpertOffload:
         leases = self._scheduler.demand(
             self._identity(self.layer_index, expert_id) for expert_id in expert_ids
         )
+        if self.layer_index == 0 and self._prepare_calls % 64 == 0:
+            logger.info(
+                "Expert offload runtime metrics: %s",
+                self._scheduler.snapshot_metrics(),
+            )
         return PreparedScheduledMarlinExperts(self, leases)
 
     def record_kernel_completion(self, leases: list[SlotLease]) -> None:

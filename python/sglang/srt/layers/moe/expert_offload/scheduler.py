@@ -91,6 +91,8 @@ class DeadlineExpertScheduler:
             "prefetch_expired": 0,
             "reads_submitted": 0,
             "reads_deduplicated": 0,
+            "demand_accesses": 0,
+            "demand_cache_hits": 0,
             "demand_reads": 0,
             "publication_failures": 0,
         }
@@ -293,8 +295,10 @@ class DeadlineExpertScheduler:
         leases = []
         try:
             for identity in requested:
+                self.metrics["demand_accesses"] += 1
                 lease = self._cache.pin(identity)
                 if lease is not None:
+                    self.metrics["demand_cache_hits"] += 1
                     leases.append(lease)
                     continue
                 self._queued.pop(identity, None)
@@ -337,3 +341,17 @@ class DeadlineExpertScheduler:
         self._check_thread()
         for lease in leases:
             self._cache.unpin(lease)
+
+    def snapshot_metrics(self) -> dict[str, int | float]:
+        """Return low-volume owner-thread diagnostics without exposing state."""
+        self._check_thread()
+        accesses = self.metrics["demand_accesses"]
+        return {
+            **self.metrics,
+            "demand_cache_hit_rate": (
+                self.metrics["demand_cache_hits"] / accesses if accesses else 1.0
+            ),
+            "queued": len(self._queued),
+            "transfers": len(self._transfers),
+            "estimated_service_ms": self._service_ns / 1e6,
+        }
