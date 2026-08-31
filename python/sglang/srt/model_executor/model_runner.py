@@ -845,15 +845,35 @@ class ModelRunner:
         self.graph_shared_output = None
 
     def maybe_init_hisparse_coordinator(self):
-        if not self.enable_hisparse:
+        # HiSparse owns the target model's authoritative KV.  Speculative
+        # draft runners have their own small resident KV pool and must never
+        # attach a second coordinator to the target's backing store.
+        if not self.enable_hisparse or self.is_draft_worker:
+            return
+        from sglang.srt.mem_cache.active_sparse_kv import (
+            ActiveSparseKVConfig,
+            ActiveSparseQSAKVCoordinator,
+        )
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        hisparse_cfg = parse_hisparse_config(self.server_args)
+        active_config = ActiveSparseKVConfig.from_hisparse_extra_config(
+            hisparse_cfg.sparse_extra_config
+        )
+        if active_config.backend == "nvme":
+            self.hisparse_coordinator = ActiveSparseQSAKVCoordinator(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                config=active_config,
+                device=self.device,
+                rank=self.ps.tp_rank,
+                max_running_requests=self.max_running_requests,
+            )
             return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,
         )
-        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-        hisparse_cfg = parse_hisparse_config(self.server_args)
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )

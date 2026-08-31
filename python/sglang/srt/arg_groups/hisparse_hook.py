@@ -88,6 +88,53 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
 
     hf_config = server_args.get_model_config().hf_config
+    from sglang.srt.layers.attention.qsa.config import (
+        QSA_VARIANT_COMPRESSED,
+        parse_qsa_profile,
+    )
+    from sglang.srt.mem_cache.active_sparse_kv import ActiveSparseKVConfig
+    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+    qsa_profile = parse_qsa_profile(hf_config)
+    hisparse_config = parse_hisparse_config(server_args)
+    active_kv_config = ActiveSparseKVConfig.from_hisparse_extra_config(
+        hisparse_config.sparse_extra_config
+    )
+    if active_kv_config.backend == "nvme":
+        if qsa_profile is None or qsa_profile.variant != QSA_VARIANT_COMPRESSED:
+            raise ValueError(
+                "NVMe active sparse-KV currently supports compressed QSA only"
+            )
+        if _is_hip():
+            raise ValueError("NVMe active QSA KV is currently CUDA-only")
+        if hisparse_config.top_k != qsa_profile.budget:
+            raise ValueError(
+                "HiSparse top_k must equal the QSA token budget: "
+                f"{hisparse_config.top_k} != {qsa_profile.budget}"
+            )
+        if hisparse_config.device_buffer_size % qsa_profile.compress_ratio:
+            raise ValueError(
+                "HiSparse device_buffer_size must be divisible by the QSA "
+                "compression ratio"
+            )
+        resolved_dtype = getattr(server_args, "kv_cache_dtype", None)
+        if resolved_dtype == "bf16":
+            resolved_dtype = "bfloat16"
+        if resolved_dtype not in ("auto", "bfloat16"):
+            raise ValueError(
+                "exact NVMe active QSA KV currently requires BF16 KV cache"
+            )
+        if not server_args.disable_cuda_graph:
+            raise ValueError(
+                "NVMe active QSA KV currently requires --disable-cuda-graph"
+            )
+        if server_args.enable_hierarchical_cache:
+            raise ValueError(
+                "NVMe active QSA KV cannot yet be combined with HiCache; "
+                "Radix prefix sharing remains supported"
+            )
+        return
+
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = _is_hip()
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (

@@ -1576,6 +1576,26 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+            if self.server_args.enable_hisparse and not self.is_draft_worker:
+                from sglang.srt.mem_cache.active_sparse_kv import (
+                    ActiveSparseKVConfig,
+                    active_qsa_hot_token_capacity,
+                )
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                hisparse_config = parse_hisparse_config(self.server_args)
+                active_config = ActiveSparseKVConfig.from_hisparse_extra_config(
+                    hisparse_config.sparse_extra_config
+                )
+                if active_config.backend == "nvme":
+                    extra_args["full_kv_token_capacity"] = (
+                        active_qsa_hot_token_capacity(
+                            device_buffer_tokens=hisparse_config.device_buffer_size,
+                            max_running_requests=max_running_requests,
+                            block_tokens=qsa_profile.compress_ratio,
+                            page_size=self.pool_page_size,
+                        )
+                    )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
@@ -1735,22 +1755,47 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 else:
+                    active_qsa_nvme = False
                     if get_memory().enable_hisparse:
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
-                        token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens,
-                            page_size=get_schedule().page_size,
+                        from sglang.srt.mem_cache.active_sparse_kv.config import (
+                            ActiveSparseKVConfig,
+                        )
+
+                        active_qsa_nvme = (
+                            ActiveSparseKVConfig.from_hisparse_extra_config(
+                                hisparse_cfg.sparse_extra_config
+                            ).backend
+                            == "nvme"
+                        )
+                        if not active_qsa_nvme:
+                            token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
+                                sizes.max_total_num_tokens,
+                                page_size=get_schedule().page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            )
+                    if active_qsa_nvme:
+                        # Logical pages still belong to Radix/the normal paged
+                        # allocator.  Only their exact QSA K/V payload is
+                        # virtualized by the active-NVMe coordinator.
+                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                            page_size=get_schedule().page_size
+                            * get_parallel().attn_dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
-                            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                         )
-                    elif (
+                    elif not get_memory().enable_hisparse and (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled
                     ):
                         token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -1760,7 +1805,7 @@ class KVCacheConfigurator:
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                         )
-                    else:
+                    elif not get_memory().enable_hisparse:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size

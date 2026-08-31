@@ -3092,8 +3092,13 @@ class Scheduler(
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
-        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
-        if self.enable_hisparse:
+        # Host-backed HiSparse delays prefill-to-decode while KV is staged.
+        # Exact active-KV writes through synchronously and uses the ordinary
+        # transition, preserving speculative relay metadata from last_batch.
+        uses_hisparse_staging = self.enable_hisparse and getattr(
+            self.hisparse_coordinator, "requires_staging", True
+        )
+        if uses_hisparse_staging:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -3106,7 +3111,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not uses_hisparse_staging
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):

@@ -1395,6 +1395,65 @@ class QwenSparseAttnBackend(AttentionBackend):
         slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
+    def _active_kv_coordinator(self):
+        coordinator = getattr(self.token_to_kv_pool, "active_kv_coordinator", None)
+        return coordinator
+
+    def _forward_active_kv_extend(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exact bounded-KV prefill path.
+
+        Rows are greedily grouped while their selected-block union fits the hot
+        cache.  This preserves exactness and turns highly overlapping prefill
+        selections into one batched NVMe materialization instead of one I/O
+        cycle per query row.
+        """
+
+        metadata = self._resolve_metadata(forward_batch)
+        logical_slots = self._logical_to_physical(topk_indices, metadata)
+        coordinator = self._active_kv_coordinator()
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        logical_cpu = logical_slots.detach().to("cpu", dtype=torch.int64)
+        capacity = coordinator.materialization_block_capacity
+        groups = []
+        group_start = 0
+        group_blocks = set()
+        for row in range(q.shape[0]):
+            row_blocks = {
+                int(slot) // coordinator.block_tokens
+                for slot in logical_cpu[row].tolist()
+                if int(slot) >= 0
+            }
+            if group_blocks and len(group_blocks | row_blocks) > capacity:
+                groups.append((group_start, row))
+                group_start = row
+                group_blocks = set()
+            group_blocks.update(row_blocks)
+        if group_start < q.shape[0]:
+            groups.append((group_start, q.shape[0]))
+
+        outputs = []
+        for start, end in groups:
+            hot_slots = coordinator.materialize_slots(
+                layer.layer_id, logical_slots[start:end]
+            )
+            outputs.append(
+                qsa_sparse_attention(
+                    q[start:end],
+                    k_buffer,
+                    v_buffer,
+                    hot_slots,
+                    layer.scaling,
+                )
+            )
+        return torch.cat(outputs, dim=0).reshape(q.shape[0], -1)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1424,6 +1483,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         # rows the indexer produced.  Only valid rows may reach the paged or
         # compiled kernels; outputs are zero-restored to the query row count.
         q = q[:num_valid_rows]
+        if self._active_kv_coordinator() is not None:
+            output = self._forward_active_kv_extend(
+                q, layer, forward_batch, topk_indices
+            )
+            return self._pad_extend_output(output, num_output_rows)
         if self._is_speculative_paged_mode(forward_batch.forward_mode):
             output = self._forward_paged_attention(
                 q, layer, forward_batch, topk_indices
@@ -1646,10 +1710,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer: torch.Tensor,
         layer,
         metadata: QwenSparseAttnMetadata,
-        topk_indices: torch.Tensor,
+        topk_indices: Optional[torch.Tensor] = None,
+        physical_slots: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Packed sparse decode without flash-attn-4's broken SM121 varlen path."""
-        slots = self._logical_to_physical(topk_indices, metadata)
+        if physical_slots is None:
+            if topk_indices is None:
+                raise ValueError("QSA SM121 sparse attention needs selected slots")
+            slots = self._logical_to_physical(topk_indices, metadata)
+        else:
+            slots = physical_slots
         repeats = q.shape[1] // k_buffer.shape[1]
         outputs = []
         for row in range(q.shape[0]):
@@ -1714,6 +1784,25 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        coordinator = self._active_kv_coordinator()
+        if coordinator is not None:
+            if not is_sm121():
+                raise RuntimeError(
+                    "exact NVMe active QSA KV currently has a validated "
+                    "attention path only on SM121"
+                )
+            logical_slots = self._logical_to_physical(topk_indices, metadata)
+            physical_slots = coordinator.materialize_slots(
+                layer.layer_id, logical_slots
+            )
+            return self._forward_sm121_sdpa_sparse(
+                q,
+                k_buffer,
+                v_buffer,
+                layer,
+                metadata,
+                physical_slots=physical_slots,
+            )
         if is_sm121():
             return self._forward_sm121_sdpa_sparse(
                 q, k_buffer, v_buffer, layer, metadata, topk_indices

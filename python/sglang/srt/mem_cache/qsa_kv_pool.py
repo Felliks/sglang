@@ -12,7 +12,12 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import (
+    GB,
+    HybridLinearKVPool,
+    MambaPool,
+    unwrap_write_loc,
+)
 
 
 def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
@@ -75,7 +80,18 @@ class QSATokenToKVPool(HybridLinearKVPool):
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        full_kv_token_capacity: Optional[int] = None,
     ):
+        if (
+            min(
+                qsa_index_kv_heads,
+                qsa_index_head_dim,
+                qsa_compress_ratio,
+                qsa_token_topk,
+            )
+            <= 0
+        ):
+            raise ValueError("QSA cache configuration values must be positive")
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
                 "compressed QSA requires a paged full-KV cache with the page "
@@ -85,6 +101,29 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 "needs the mamba extra-buffer strategy or "
                 "--disable-radix-cache (see the Qwen4-Exp arg overrides)."
             )
+        logical_size = int(size)
+        physical_size = (
+            logical_size
+            if full_kv_token_capacity is None
+            else int(full_kv_token_capacity)
+        )
+        if physical_size <= 0 or physical_size > logical_size:
+            raise ValueError(
+                "full_kv_token_capacity must be in (0, logical size], got "
+                f"physical={physical_size}, logical={logical_size}"
+            )
+        if physical_size % qsa_compress_ratio:
+            raise ValueError(
+                "full_kv_token_capacity must be divisible by the QSA "
+                f"compression ratio, got {physical_size} / {qsa_compress_ratio}"
+            )
+        if full_kv_token_capacity is not None and post_capture_active:
+            raise ValueError(
+                "bounded active QSA KV is incompatible with post-capture backing"
+            )
+        self.logical_size = logical_size
+        self.full_kv_token_capacity = physical_size
+        self.active_kv_coordinator = None
         # The base __init__ computes mem_usage through the overridden
         # get_kv_size_bytes before the QSA buffers exist; give them empty
         # placeholders first and recompute mem_usage at the end.
@@ -92,7 +131,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_compressed_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
         super().__init__(
-            size=size,
+            size=physical_size,
             dtype=dtype,
             page_size=page_size,
             head_num=head_num,
@@ -108,16 +147,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
             quant_method=quant_method,
             post_capture_active=post_capture_active,
         )
-        if (
-            min(
-                qsa_index_kv_heads,
-                qsa_index_head_dim,
-                qsa_compress_ratio,
-                qsa_token_topk,
-            )
-            <= 0
-        ):
-            raise ValueError("QSA cache configuration values must be positive")
         if qsa_token_topk % qsa_compress_ratio != 0:
             raise ValueError("qsa_token_topk must be divisible by qsa_compress_ratio")
         self.qsa_compress_ratio = int(qsa_compress_ratio)
@@ -125,7 +154,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
-        state_size = size + page_size
+        # Externally this pool still represents the allocator's complete
+        # logical slot space.  Only ``full_kv_pool`` is physically bounded.
+        self.size = logical_size
+        state_size = logical_size + page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
@@ -181,6 +213,53 @@ class QSATokenToKVPool(HybridLinearKVPool):
         ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+
+    @property
+    def uses_bounded_full_kv(self) -> bool:
+        return self.full_kv_token_capacity != self.logical_size
+
+    def register_active_kv_coordinator(self, coordinator) -> None:
+        """Attach the sole owner of logical-to-hot placement and persistence."""
+        if not self.uses_bounded_full_kv:
+            raise RuntimeError("active-KV coordinator requires a bounded pool")
+        if self.active_kv_coordinator is not None:
+            raise RuntimeError("active-KV coordinator is already registered")
+        self.active_kv_coordinator = coordinator
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        logical_loc, _, full_loc = unwrap_write_loc(loc)
+        logical_loc = full_loc if full_loc is not None else logical_loc
+        plan = None
+        physical_loc = logical_loc
+        if self.uses_bounded_full_kv:
+            if self.active_kv_coordinator is None:
+                raise RuntimeError(
+                    "bounded QSA KV pool has no active-KV coordinator"
+                )
+            plan = self.active_kv_coordinator.prepare_write(
+                layer.layer_id, logical_loc
+            )
+            physical_loc = plan.physical_locs
+        super().set_kv_buffer(
+            layer,
+            physical_loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            dcp_kv_mask=dcp_kv_mask,
+        )
+        if plan is not None:
+            self.active_kv_coordinator.commit_write(plan)
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[

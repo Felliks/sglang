@@ -148,6 +148,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._active_qsa_hot_bias = 0
+        self._active_qsa_target_kv_cell_size = 0
+        self._active_qsa_enabled = False
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -158,6 +161,56 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = len(effective_layer_ids)
         else:
             num_layers = kvc.layer_info.num_effective_layers
+
+        if kvc.server_args.enable_hisparse and not kvc.is_draft_worker:
+            from sglang.srt.layers.attention.qsa.config import (
+                QSA_VARIANT_COMPRESSED,
+                parse_qsa_profile,
+            )
+            from sglang.srt.mem_cache.active_sparse_kv import (
+                ActiveSparseKVConfig,
+                active_qsa_hot_token_capacity,
+            )
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            qsa_profile = parse_qsa_profile(kvc.model_config.hf_text_config)
+            hisparse_config = parse_hisparse_config(kvc.server_args)
+            active_config = ActiveSparseKVConfig.from_hisparse_extra_config(
+                hisparse_config.sparse_extra_config
+            )
+            if active_config.backend == "nvme":
+                if (
+                    qsa_profile is None
+                    or qsa_profile.variant != QSA_VARIANT_COMPRESSED
+                ):
+                    raise ValueError(
+                        "NVMe active sparse-KV currently requires compressed QSA"
+                    )
+                max_running_requests = kvc.server_args.max_running_requests
+                if max_running_requests is None:
+                    raise ValueError(
+                        "NVMe active sparse-KV requires explicit "
+                        "--max-running-requests"
+                    )
+                hot_tokens = active_qsa_hot_token_capacity(
+                    device_buffer_tokens=hisparse_config.device_buffer_size,
+                    max_running_requests=max_running_requests,
+                    block_tokens=qsa_profile.compress_ratio,
+                    page_size=kvc.page_size,
+                )
+                kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
+                self._active_qsa_target_kv_cell_size = (
+                    kvc.model_config.get_num_kv_heads(
+                        get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                    )
+                    * (kvc.model_config.head_dim + kvc.model_config.v_head_dim)
+                    * num_layers
+                    * kv_size
+                )
+                self._active_qsa_hot_bias = (
+                    hot_tokens * self._active_qsa_target_kv_cell_size
+                )
+                self._active_qsa_enabled = True
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         has_kv_on_another_pp_stage = (
@@ -212,6 +265,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
+                    if self._active_qsa_enabled:
+                        # The target's full QSA KV is a fixed hot-cache bias,
+                        # while the current draft pool remains fully resident.
+                        self._cell_size += int(
+                            self._active_qsa_target_kv_cell_size
+                            * draft_num_layers
+                            / int(num_layers)
+                        )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
@@ -351,6 +412,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         cell_size += self._compute_qsa_cell_size(
             hf_config=model_config.hf_text_config, num_layers=num_layers
         )
+        if self._active_qsa_enabled:
+            cell_size -= self._active_qsa_target_kv_cell_size
+            if cell_size <= 0:
+                raise RuntimeError(
+                    "active QSA KV sizing removed more than the full-KV term"
+                )
         return cell_size
 
     @staticmethod
@@ -448,7 +515,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        available_bytes = max(available_bytes - self._active_qsa_hot_bias, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
