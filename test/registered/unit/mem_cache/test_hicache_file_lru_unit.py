@@ -124,8 +124,12 @@ class TestParseSize(CustomTestCase):
         self.assertEqual(_parse_size_to_bytes("1024"), 1024)
         self.assertEqual(_parse_size_to_bytes("1k"), 1000)
         self.assertEqual(_parse_size_to_bytes("1Ki"), 1024)
+        self.assertEqual(_parse_size_to_bytes("1KiB"), 1024)
         self.assertEqual(_parse_size_to_bytes("1Mi"), 1 << 20)
+        self.assertEqual(_parse_size_to_bytes("1MiB"), 1 << 20)
         self.assertEqual(_parse_size_to_bytes("2Gi"), 2 * (1 << 30))
+        self.assertEqual(_parse_size_to_bytes("2GiB"), 2 * (1 << 30))
+        self.assertEqual(_parse_size_to_bytes("2GB"), 2 * 10**9)
         self.assertEqual(_parse_size_to_bytes("1.5G"), int(1.5 * 10**9))
 
     def test_invalid_returns_zero(self):

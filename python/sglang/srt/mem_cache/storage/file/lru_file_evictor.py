@@ -37,8 +37,13 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_size_to_bytes(value: Any) -> int:
-    """Parse a size to bytes via human_readable_int (e.g. '200G', '1Gi', '1048576').
-    None / empty / '0' disables; an invalid value also disables (with a warning)."""
+    """Parse a size to bytes (e.g. ``200G``, ``1GiB``, or ``1048576``).
+
+    ``human_readable_int`` historically accepts ``G`` and ``Gi`` but not the
+    equally standard ``GB`` and ``GiB`` spellings. Normalize the optional
+    trailing ``B`` here so deployment configuration cannot silently turn a
+    bounded file cache into an unbounded one.
+    """
     if value is None:
         return 0
     if isinstance(value, (int, float)):
@@ -46,6 +51,11 @@ def _parse_size_to_bytes(value: Any) -> int:
     s = str(value).strip()
     if not s or s == "0":
         return 0
+    lower = s.lower()
+    if lower.endswith(
+        ("kb", "mb", "gb", "tb", "pb", "kib", "mib", "gib", "tib", "pib")
+    ):
+        s = s[:-1]
     try:
         return max(0, human_readable_int(s))
     except (argparse.ArgumentTypeError, ValueError):
