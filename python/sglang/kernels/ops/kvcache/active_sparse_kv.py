@@ -21,6 +21,7 @@ def _jit_active_sparse_kv_module(
         cuda_wrappers=[
             ("unpack_qsa_records", f"unpack_qsa_records<{template_args}>"),
             ("pack_qsa_records", f"pack_qsa_records<{template_args}>"),
+            ("resolve_qsa_slots", f"resolve_qsa_slots<{template_args}>"),
         ],
     )
 
@@ -73,4 +74,42 @@ def pack_qsa_records(
     )
 
 
-__all__ = ["pack_qsa_records", "unpack_qsa_records"]
+def resolve_qsa_slots(
+    *,
+    logical_slots: torch.Tensor,
+    logical_to_hot: torch.Tensor,
+    hot_to_logical: torch.Tensor,
+    physical_slots: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    seen_epochs: torch.Tensor,
+    selected_count: torch.Tensor,
+    miss_count: torch.Tensor,
+    epoch: int,
+    block_tokens: int = 4,
+    record_bytes: int = 8192,
+    block_size: int = 256,
+) -> None:
+    """Resolve active-QSA slots and compact unique selected blocks on CUDA.
+
+    The reverse directory is checked in the same kernel, so recycled hot slots
+    cannot be mistaken for hits.  Only the compact block list ever needs to
+    cross to CPU, and only when at least one miss requires an NVMe placement.
+    """
+
+    if logical_slots.dtype != torch.int32 or not logical_slots.is_contiguous():
+        raise ValueError("logical_slots must be contiguous int32")
+    module = _jit_active_sparse_kv_module(block_tokens, record_bytes, block_size)
+    module.resolve_qsa_slots(
+        logical_slots,
+        logical_to_hot,
+        hot_to_logical,
+        physical_slots,
+        selected_blocks,
+        seen_epochs,
+        selected_count,
+        miss_count,
+        epoch,
+    )
+
+
+__all__ = ["pack_qsa_records", "resolve_qsa_slots", "unpack_qsa_records"]

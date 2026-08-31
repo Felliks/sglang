@@ -159,4 +159,111 @@ void pack_qsa_records(tvm::ffi::TensorView source_k,
       staging.strides()[0]);
 }
 
+template <int BLOCK_SIZE, int BLOCK_TOKENS, int RECORD_BYTES>
+__global__ void resolve_qsa_slots_kernel(
+    const int32_t* __restrict__ logical_slots,
+    const int32_t* __restrict__ logical_to_hot,
+    const int32_t* __restrict__ hot_to_logical,
+    int32_t* __restrict__ physical_slots,
+    int32_t* __restrict__ selected_blocks,
+    int32_t* __restrict__ seen_epochs,
+    int32_t* __restrict__ selected_count,
+    int32_t* __restrict__ miss_count,
+    int32_t epoch,
+    int64_t num_slots,
+    int64_t logical_blocks,
+    int64_t hot_blocks) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
+       index < num_slots;
+       index += static_cast<int64_t>(gridDim.x) * BLOCK_SIZE) {
+    const int32_t logical_slot = logical_slots[index];
+    if (logical_slot < 0) {
+      physical_slots[index] = -1;
+      continue;
+    }
+    const int32_t logical_block = logical_slot / BLOCK_TOKENS;
+    if (logical_block < 0 || logical_block >= logical_blocks) {
+      physical_slots[index] = -1;
+      atomicAdd(miss_count, 1);
+      continue;
+    }
+
+    // One representative per logical block is emitted without sorting the
+    // full [rows, top-k] selection matrix.  Epoch tags avoid clearing a large
+    // bitmap on every layer/step.
+    const int32_t old_epoch = atomicExch(&seen_epochs[logical_block], epoch);
+    if (old_epoch != epoch) {
+      const int32_t output = atomicAdd(selected_count, 1);
+      selected_blocks[output] = logical_block;
+    }
+
+    const int32_t hot_block = logical_to_hot[logical_block];
+    const bool resident = hot_block >= 0 && hot_block < hot_blocks &&
+        hot_to_logical[hot_block] == logical_block;
+    physical_slots[index] = resident
+        ? hot_block * BLOCK_TOKENS + logical_slot % BLOCK_TOKENS
+        : -1;
+    if (!resident) {
+      atomicAdd(miss_count, 1);
+    }
+  }
+}
+
+template <int BLOCK_SIZE, int BLOCK_TOKENS, int RECORD_BYTES>
+void resolve_qsa_slots(tvm::ffi::TensorView logical_slots,
+                       tvm::ffi::TensorView logical_to_hot,
+                       tvm::ffi::TensorView hot_to_logical,
+                       tvm::ffi::TensorView physical_slots,
+                       tvm::ffi::TensorView selected_blocks,
+                       tvm::ffi::TensorView seen_epochs,
+                       tvm::ffi::TensorView selected_count,
+                       tvm::ffi::TensorView miss_count,
+                       int64_t epoch) {
+  using namespace host;
+  if (logical_slots.dtype().code != kDLInt || logical_slots.dtype().bits != 32 ||
+      logical_to_hot.dtype().code != kDLInt || logical_to_hot.dtype().bits != 32 ||
+      hot_to_logical.dtype().code != kDLInt || hot_to_logical.dtype().bits != 32 ||
+      physical_slots.dtype().code != kDLInt || physical_slots.dtype().bits != 32) {
+    throw std::runtime_error("resolve_qsa_slots: slot tensors must be int32");
+  }
+  if (logical_to_hot.ndim() != 1 || hot_to_logical.ndim() != 1 ||
+      selected_blocks.ndim() != 1 || seen_epochs.ndim() != 1 ||
+      selected_count.ndim() != 1 || miss_count.ndim() != 1) {
+    throw std::runtime_error("resolve_qsa_slots: invalid tensor rank");
+  }
+  int64_t num_slots = 1;
+  int64_t physical_num_slots = 1;
+  for (int dim = 0; dim < logical_slots.ndim(); ++dim) {
+    num_slots *= logical_slots.shape()[dim];
+  }
+  for (int dim = 0; dim < physical_slots.ndim(); ++dim) {
+    physical_num_slots *= physical_slots.shape()[dim];
+  }
+  if (num_slots == 0) {
+    return;
+  }
+  if (physical_num_slots != num_slots ||
+      selected_blocks.shape()[0] < logical_to_hot.shape()[0] ||
+      seen_epochs.shape()[0] != logical_to_hot.shape()[0] ||
+      selected_count.shape()[0] != 1 || miss_count.shape()[0] != 1) {
+    throw std::runtime_error("resolve_qsa_slots: geometry mismatch");
+  }
+  const auto device = LaunchKernel::resolve_device(logical_slots.device());
+  const int64_t blocks = (num_slots + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  LaunchKernel(blocks, BLOCK_SIZE, device)(
+      resolve_qsa_slots_kernel<BLOCK_SIZE, BLOCK_TOKENS, RECORD_BYTES>,
+      static_cast<const int32_t*>(logical_slots.data_ptr()),
+      static_cast<const int32_t*>(logical_to_hot.data_ptr()),
+      static_cast<const int32_t*>(hot_to_logical.data_ptr()),
+      static_cast<int32_t*>(physical_slots.data_ptr()),
+      static_cast<int32_t*>(selected_blocks.data_ptr()),
+      static_cast<int32_t*>(seen_epochs.data_ptr()),
+      static_cast<int32_t*>(selected_count.data_ptr()),
+      static_cast<int32_t*>(miss_count.data_ptr()),
+      static_cast<int32_t>(epoch),
+      num_slots,
+      logical_to_hot.shape()[0],
+      hot_to_logical.shape()[0]);
+}
+
 }  // namespace sglang

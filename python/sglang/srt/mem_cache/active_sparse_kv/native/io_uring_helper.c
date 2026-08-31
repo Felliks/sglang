@@ -13,17 +13,19 @@
 enum sglang_active_kv_operation {
     SGLANG_ACTIVE_KV_READ = 0,
     SGLANG_ACTIVE_KV_WRITE = 1,
+    SGLANG_ACTIVE_KV_READ_BUFFERED = 2,
 };
 
 struct sglang_active_kv_uring {
     struct io_uring ring;
-    int fd;
+    int direct_fd;
+    int buffered_fd;
     unsigned depth;
     size_t buffer_bytes;
     void **buffers;
 };
 
-uint32_t sglang_active_kv_uring_abi_version(void) { return 1; }
+uint32_t sglang_active_kv_uring_abi_version(void) { return 2; }
 
 int sglang_active_kv_uring_create(const char *path, void *const *buffers,
                                   size_t buffer_bytes, unsigned depth,
@@ -45,7 +47,8 @@ int sglang_active_kv_uring_create(const char *path, void *const *buffers,
         free(handle);
         return -ENOMEM;
     }
-    handle->fd = -1;
+    handle->direct_fd = -1;
+    handle->buffered_fd = -1;
     handle->depth = depth;
     handle->buffer_bytes = buffer_bytes;
     struct io_uring_params params = {0};
@@ -70,8 +73,8 @@ int sglang_active_kv_uring_create(const char *path, void *const *buffers,
         free(handle);
         return result;
     }
-    handle->fd = open(path, O_RDWR | O_DIRECT | O_CLOEXEC);
-    if (handle->fd < 0) {
+    handle->direct_fd = open(path, O_RDWR | O_DIRECT | O_CLOEXEC);
+    if (handle->direct_fd < 0) {
         result = -errno;
         io_uring_unregister_buffers(&handle->ring);
         io_uring_queue_exit(&handle->ring);
@@ -79,9 +82,21 @@ int sglang_active_kv_uring_create(const char *path, void *const *buffers,
         free(handle);
         return result;
     }
-    result = io_uring_register_files(&handle->ring, &handle->fd, 1);
+    handle->buffered_fd = open(path, O_RDWR | O_CLOEXEC);
+    if (handle->buffered_fd < 0) {
+        result = -errno;
+        close(handle->direct_fd);
+        io_uring_unregister_buffers(&handle->ring);
+        io_uring_queue_exit(&handle->ring);
+        free(handle->buffers);
+        free(handle);
+        return result;
+    }
+    const int files[2] = {handle->direct_fd, handle->buffered_fd};
+    result = io_uring_register_files(&handle->ring, files, 2);
     if (result < 0) {
-        close(handle->fd);
+        close(handle->buffered_fd);
+        close(handle->direct_fd);
         io_uring_unregister_buffers(&handle->ring);
         io_uring_queue_exit(&handle->ring);
         free(handle->buffers);
@@ -99,7 +114,8 @@ int sglang_active_kv_uring_submit_batch(
     if (!handle || !buffer_indices || !offsets || !count ||
         count > handle->depth ||
         (operation != SGLANG_ACTIVE_KV_READ &&
-         operation != SGLANG_ACTIVE_KV_WRITE)) {
+         operation != SGLANG_ACTIVE_KV_WRITE &&
+         operation != SGLANG_ACTIVE_KV_READ_BUFFERED)) {
         return -EINVAL;
     }
     for (unsigned item = 0; item < count; ++item) {
@@ -111,8 +127,10 @@ int sglang_active_kv_uring_submit_batch(
         if (!sqe) {
             return -EAGAIN;
         }
-        if (operation == SGLANG_ACTIVE_KV_READ) {
-            io_uring_prep_read_fixed(sqe, 0, handle->buffers[buffer_index],
+        if (operation == SGLANG_ACTIVE_KV_READ ||
+            operation == SGLANG_ACTIVE_KV_READ_BUFFERED) {
+            const int fixed_fd = operation == SGLANG_ACTIVE_KV_READ ? 0 : 1;
+            io_uring_prep_read_fixed(sqe, fixed_fd, handle->buffers[buffer_index],
                                      handle->buffer_bytes, offsets[item],
                                      buffer_index);
         } else {
@@ -155,8 +173,11 @@ void sglang_active_kv_uring_destroy(void *opaque) {
         return;
     }
     io_uring_unregister_files(&handle->ring);
-    if (handle->fd >= 0) {
-        close(handle->fd);
+    if (handle->buffered_fd >= 0) {
+        close(handle->buffered_fd);
+    }
+    if (handle->direct_fd >= 0) {
+        close(handle->direct_fd);
     }
     io_uring_unregister_buffers(&handle->ring);
     io_uring_queue_exit(&handle->ring);

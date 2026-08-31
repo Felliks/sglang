@@ -96,7 +96,6 @@ def _resolve_flash_attn_varlen_func():
         ) from exc
 
 
-
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     """Per-forward metadata consumed by core sparse attention."""
 
@@ -133,7 +132,10 @@ class QSAMTPSharedSparseIndices:
     def __init__(
         self, *, layer_ids, num_requests, token_topk, tail_width, device
     ) -> None:
-        self.layer_slots = {int(l): i for i, l in enumerate(sorted(layer_ids))}
+        self.layer_slots = {
+            int(layer_id): index
+            for index, layer_id in enumerate(sorted(layer_ids))
+        }
         self.tail_width = tail_width
         self.trash_row = num_requests
         # Logical index 0 keeps never-captured rows (graph warmup dummies)
@@ -258,8 +260,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             return
         if int(getattr(spec_info, "topk", 1) or 1) != 1:
             raise NotImplementedError(
-                "Qwen QSA target verification supports only "
-                "speculative_eagle_topk=1"
+                "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
         if draft_tokens > self.compress_ratio:
@@ -379,9 +380,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     extend_lengths = torch.cat(
                         [
                             extend_lengths,
-                            torch.zeros(
-                                bs - extend_lengths.numel(), dtype=torch.int32
-                            ),
+                            torch.zeros(bs - extend_lengths.numel(), dtype=torch.int32),
                         ]
                     )
             else:
@@ -415,9 +414,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 torch.full((int(extend_len),), prefix_len, dtype=torch.int32)
             )
         row_lengths = (
-            torch.cat(row_lengths)
-            if row_lengths
-            else torch.empty(0, dtype=torch.int32)
+            torch.cat(row_lengths) if row_lengths else torch.empty(0, dtype=torch.int32)
         )
         row_prefix_lengths = (
             torch.cat(row_prefix_lengths)
@@ -430,12 +427,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA CUDA graph speculative layout has inconsistent token count: "
                 f"capacity={num_tokens}, actual={actual_rows}"
             )
-        repeats = extend_lengths.to(
-            device=req_pool_indices.device, dtype=torch.long
-        )
-        row_req_pool_indices = torch.repeat_interleave(
-            req_pool_indices[:bs], repeats
-        )
+        repeats = extend_lengths.to(device=req_pool_indices.device, dtype=torch.long)
+        row_req_pool_indices = torch.repeat_interleave(req_pool_indices[:bs], repeats)
         # Draft-extend graphs always execute the captured static token shape,
         # while a replay can contain fewer accepted tokens.  The runner packs
         # real rows first and zero-fills the tail, so give those tail rows safe
@@ -543,9 +536,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # member sits chunk-locally at (block * ratio - prefix).
             member_rows = torch.where(
                 valid,
-                row_token_starts[rows]
-                + blocks * compress_ratio
-                - prefix_lens[rows],
+                row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
                 torch.zeros_like(blocks),
             )
         return write_locs, group_end_positions, rows, member_rows
@@ -610,10 +601,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.device = forward_batch.seq_lens.device
         if not self.max_context_len:
             self.max_context_len = self.req_to_token.shape[1]
-        if (
-            forward_batch.forward_mode.is_idle()
-            or forward_batch.seq_lens.numel() == 0
-        ):
+        if forward_batch.forward_mode.is_idle() or forward_batch.seq_lens.numel() == 0:
             # DP attention runs IDLE dummy forwards on ranks without work, and
             # the MTP multi-step wrapper forwards them as zero-row DECODE
             # steps.  Model layers skip attention for these batches, but
@@ -621,9 +609,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # of falling into the extend/decode paths on empty tensors.
             return self._empty_metadata(forward_batch)
         original_mode = getattr(forward_batch, "_original_forward_mode", None)
-        if original_mode is not None and self._is_speculative_paged_mode(
-            original_mode
-        ):
+        if original_mode is not None and self._is_speculative_paged_mode(original_mode):
             # DP MAX_LEN pseudo-extend rewrites the mode to EXTEND with
             # extend_seq_lens == 1 per request, which loses the per-request
             # draft fan-out of target_verify/draft_extend.  Refuse to guess
@@ -633,9 +619,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 f"speculative mode {original_mode}: token rows would be "
                 "mis-mapped to requests"
             )
-        speculative_paged = self._is_speculative_paged_mode(
-            forward_batch.forward_mode
-        )
+        speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -691,9 +675,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             else:
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
-                    raise ValueError(
-                        "QSA extend metadata requires extend_seq_lens"
-                    )
+                    raise ValueError("QSA extend metadata requires extend_seq_lens")
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -913,8 +895,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_bs, dtype=torch.int32, device=self.device
         )
         self._graph_extend_lens_pin = [
-            torch.zeros(max_bs, dtype=torch.int32, pin_memory=True)
-            for _ in range(2)
+            torch.zeros(max_bs, dtype=torch.int32, pin_memory=True) for _ in range(2)
         ]
         self._extend_lens_pin_idx = 0
 
@@ -1065,9 +1046,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         else:
             metadata.sequence_lengths.copy_(seq_lens[:bs].to(torch.int32))
-            metadata.row_req_pool_indices.copy_(
-                req_pool_indices[:bs].to(torch.int32)
-            )
+            metadata.row_req_pool_indices.copy_(req_pool_indices[:bs].to(torch.int32))
             metadata.indexer_metadata.graph_prefix_lengths.copy_(
                 (seq_lens[:bs] - 1).clamp_min(0).to(torch.int32)
             )
@@ -1229,8 +1208,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         row_width_pages = self.req_to_token.shape[1] // full_page
         num_pages = min(max_pages, row_width_pages)
         table = (
-            self.req_to_token[req_indices, : num_pages * full_page : full_page]
-            .long()
+            self.req_to_token[req_indices, : num_pages * full_page : full_page].long()
             // full_page
         ).clamp_min(0)
         page_table[:, :num_pages].copy_(table.to(torch.int32))
@@ -1419,36 +1397,110 @@ class QwenSparseAttnBackend(AttentionBackend):
         coordinator = self._active_kv_coordinator()
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        resident_slots = coordinator.resolve_resident_slots(
+            layer.layer_id, logical_slots
+        )
+        if resident_slots is not None:
+            extend_lens = torch.tensor(
+                [int(length) for length in forward_batch.extend_seq_lens_cpu],
+                dtype=torch.int32,
+                device=q.device,
+            )
+            sequence_lens = torch.tensor(
+                [int(length) for length in forward_batch.seq_lens_cpu],
+                dtype=torch.int32,
+                device=q.device,
+            )
+            cu_q = F.pad(extend_lens.cumsum(0), (1, 0)).contiguous()
+            # Every request addresses the same process-wide physical hot pool.
+            # Repeated zero bases make the chunk kernel consume absolute slots.
+            cu_k = torch.zeros(
+                extend_lens.numel() + 1, dtype=torch.int32, device=q.device
+            )
+            return sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                k_buffer,
+                v_buffer,
+                resident_slots.contiguous(),
+                cu_q,
+                cu_k,
+                sequence_lens,
+                layer.scaling,
+            ).reshape(q.shape[0], -1)
         logical_cpu = logical_slots.detach().to("cpu", dtype=torch.int64)
         capacity = coordinator.materialization_block_capacity
+        extend_lens = [int(length) for length in forward_batch.extend_seq_lens_cpu]
+        sequence_lens = [int(length) for length in forward_batch.seq_lens_cpu]
+        prefix_lens = [
+            sequence_lens[index] - extend_lens[index]
+            for index in range(len(extend_lens))
+        ]
+        if sum(extend_lens) != q.shape[0]:
+            raise ValueError(
+                "active-KV extend rows do not match sequence metadata: "
+                f"rows={q.shape[0]}, extend_lens={extend_lens}"
+            )
+
+        # A group may not cross a request boundary: the chunk-prefill kernel
+        # derives each row's causal limit from one sequence length.  Within a
+        # request, split only when the selected-block union no longer fits the
+        # bounded hot cache.
         groups = []
-        group_start = 0
-        group_blocks = set()
-        for row in range(q.shape[0]):
-            row_blocks = {
-                int(slot) // coordinator.block_tokens
-                for slot in logical_cpu[row].tolist()
-                if int(slot) >= 0
-            }
-            if group_blocks and len(group_blocks | row_blocks) > capacity:
-                groups.append((group_start, row))
-                group_start = row
-                group_blocks = set()
-            group_blocks.update(row_blocks)
-        if group_start < q.shape[0]:
-            groups.append((group_start, q.shape[0]))
+        sequence_start = 0
+        for sequence_index, extend_len in enumerate(extend_lens):
+            sequence_end = sequence_start + extend_len
+            group_start = sequence_start
+            group_blocks = set()
+            for row in range(sequence_start, sequence_end):
+                row_blocks = {
+                    int(slot) // coordinator.block_tokens
+                    for slot in logical_cpu[row].tolist()
+                    if int(slot) >= 0
+                }
+                if group_blocks and len(group_blocks | row_blocks) > capacity:
+                    groups.append(
+                        (
+                            group_start,
+                            row,
+                            prefix_lens[sequence_index] + row - sequence_start,
+                        )
+                    )
+                    group_start = row
+                    group_blocks = set()
+                group_blocks.update(row_blocks)
+            if group_start < sequence_end:
+                groups.append(
+                    (
+                        group_start,
+                        sequence_end,
+                        prefix_lens[sequence_index] + extend_len,
+                    )
+                )
+            sequence_start = sequence_end
 
         outputs = []
-        for start, end in groups:
+        for start, end, visible_tokens in groups:
             hot_slots = coordinator.materialize_slots(
                 layer.layer_id, logical_slots[start:end]
             )
+            group_size = end - start
+            cu_q = torch.tensor([0, group_size], dtype=torch.int32, device=q.device)
+            # Physical indices address the process-wide hot pool directly, so
+            # its K/V base is zero.  ``visible_tokens`` is still the logical
+            # causal length at this group's final row.
+            cu_k = torch.tensor(
+                [0, k_buffer.shape[0]], dtype=torch.int32, device=q.device
+            )
+            kv_lens = torch.tensor([visible_tokens], dtype=torch.int32, device=q.device)
             outputs.append(
-                qsa_sparse_attention(
-                    q[start:end],
+                sparse_gqa_fwd_interface_triton_ck(
+                    q[start:end].contiguous(),
                     k_buffer,
                     v_buffer,
-                    hot_slots,
+                    hot_slots.to(torch.int32).contiguous(),
+                    cu_q,
+                    cu_k,
+                    kv_lens,
                     layer.scaling,
                 )
             )
@@ -1483,16 +1535,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         # rows the indexer produced.  Only valid rows may reach the paged or
         # compiled kernels; outputs are zero-restored to the query row count.
         q = q[:num_valid_rows]
-        if self._active_kv_coordinator() is not None:
-            output = self._forward_active_kv_extend(
-                q, layer, forward_batch, topk_indices
-            )
-            return self._pad_extend_output(output, num_output_rows)
-        if self._is_speculative_paged_mode(forward_batch.forward_mode):
-            output = self._forward_paged_attention(
-                q, layer, forward_batch, topk_indices
-            )
-            return self._pad_extend_output(output, num_output_rows)
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
@@ -1507,6 +1549,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        # Target-verify and draft-extend batches use speculative paged
+        # metadata.  They intentionally do not populate the ordinary extend
+        # CPU mirrors, so route them before inspecting extend_seq_lens_cpu.
+        if self._is_speculative_paged_mode(forward_batch.forward_mode):
+            output = self._forward_paged_attention(
+                q, layer, forward_batch, topk_indices
+            )
+            return self._pad_extend_output(output, num_output_rows)
+
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
         sequence_lens = [int(x) for x in forward_batch.seq_lens_cpu]
         prefix_lens = [
@@ -1527,7 +1578,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer.scaling,
             )
             return self._pad_extend_output(output, num_output_rows)
-
+        if self._active_kv_coordinator() is not None:
+            output = self._forward_active_kv_extend(
+                q, layer, forward_batch, topk_indices
+            )
+            return self._pad_extend_output(output, num_output_rows)
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
@@ -1596,7 +1651,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
 
-
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
         key = (batch, pages_per_row, device)
         cached = self._trtllm_sparse_tables.get(key)
@@ -1606,9 +1660,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_tables = (
                 torch.arange(batch, dtype=torch.int32, device=device)[:, None]
                 * pages_per_row
-                + torch.arange(pages_per_row, dtype=torch.int32, device=device)[
-                    None, :
-                ]
+                + torch.arange(pages_per_row, dtype=torch.int32, device=device)[None, :]
             ).contiguous()
             cached = (cu, block_tables)
             self._trtllm_sparse_tables[key] = cached
@@ -1647,9 +1699,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         cu_strided, block_tables = self._get_trtllm_sparse_tables(
             batch, pages_per_row, page, device
         )
-        capacity_rows = (
-            self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        )
+        capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
@@ -1701,7 +1751,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             bmm2_scale=1.0,
         )
         return output.reshape(q.shape[0], -1)
-
 
     def _forward_sm121_sdpa_sparse(
         self,
@@ -1944,9 +1993,7 @@ class QwenSparseMultiStepDraftBackend:
             .reshape(steps, -1)[step]
         )
 
-    def _make_step_forward_batch(
-        self, forward_batch, step: int, num_padding: int = 0
-    ):
+    def _make_step_forward_batch(self, forward_batch, step: int, num_padding: int = 0):
         step_forward_batch = copy(forward_batch)
         step_forward_batch.forward_mode = ForwardMode.DECODE
         step_forward_batch.seq_lens = (forward_batch.seq_lens + step + 1).to(
@@ -1973,9 +2020,7 @@ class QwenSparseMultiStepDraftBackend:
                 )
                 step_forward_batch.seq_lens_cpu[-num_padding:] = 1
         step_forward_batch.batch_size = int(step_forward_batch.seq_lens.numel())
-        step_forward_batch.out_cache_loc = self._step_out_cache_loc(
-            forward_batch, step
-        )
+        step_forward_batch.out_cache_loc = self._step_out_cache_loc(forward_batch, step)
         return step_forward_batch
 
     def set_mtp_shared_sparse_indices(self, state) -> None:
@@ -1992,9 +2037,7 @@ class QwenSparseMultiStepDraftBackend:
         for backend in self.attn_backends:
             backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_out_graph(
-        self, forward_batch, in_capture: bool = False
-    ):
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         if in_capture:
             for step, backend in enumerate(self.attn_backends):
                 # Every capture row is synthetic.  Keep its sequence length

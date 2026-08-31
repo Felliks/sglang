@@ -79,22 +79,33 @@ class ActiveKVBlockDirectory:
                     f"layer={layer}, block={block}"
                 )
 
-        resolved: list[int] = []
+        # Touch every currently resident member before assigning misses.  This
+        # prevents a miss early in the compact GPU plan from evicting another
+        # block selected by the same attention operation but listed later.
+        resolved_by_block: dict[int, int] = {}
         misses: list[tuple[int, int]] = []
         for block in unique:
             hot = self._logical_to_hot[layer][block]
-            if hot < 0:
-                hot = self._allocate_hot(layer)
-                previous = self._hot_to_logical[layer][hot]
-                if previous >= 0:
-                    self._logical_to_hot[layer][previous] = -1
-                self._hot_to_logical[layer][hot] = block
-                self._logical_to_hot[layer][block] = hot
-                misses.append((block, hot))
+            if hot >= 0:
+                self._clock += 1
+                self._last_used[layer][hot] = self._clock
+                resolved_by_block[block] = hot
+        for block in unique:
+            if block in resolved_by_block:
+                continue
+            hot = self._allocate_hot(layer)
+            previous = self._hot_to_logical[layer][hot]
+            if previous >= 0:
+                self._logical_to_hot[layer][previous] = -1
+            self._hot_to_logical[layer][hot] = block
+            self._logical_to_hot[layer][block] = hot
             self._clock += 1
             self._last_used[layer][hot] = self._clock
-            resolved.append(hot)
-        return BlockPlacement(tuple(resolved), tuple(misses))
+            resolved_by_block[block] = hot
+            misses.append((block, hot))
+        return BlockPlacement(
+            tuple(resolved_by_block[block] for block in unique), tuple(misses)
+        )
 
     def _allocate_hot(self, layer: int) -> int:
         for hot, logical in enumerate(self._hot_to_logical[layer]):

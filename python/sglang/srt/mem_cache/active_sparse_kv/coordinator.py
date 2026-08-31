@@ -7,6 +7,7 @@ from typing import NamedTuple
 import torch
 from sglang.kernels.ops.kvcache.active_sparse_kv import (
     pack_qsa_records,
+    resolve_qsa_slots,
     unpack_qsa_records,
 )
 from sglang.srt.mem_cache.active_sparse_kv.config import ActiveSparseKVConfig
@@ -94,6 +95,7 @@ class ActiveSparseQSAKVCoordinator:
                 self.extent.path,
                 record_bytes=self.record_bytes,
                 io_depth=config.io_depth,
+                page_cache_bytes=config.page_cache_bytes,
             )
         except BaseException:
             self.extent.close()
@@ -103,6 +105,41 @@ class ActiveSparseQSAKVCoordinator:
             logical_blocks=self.layout.block_capacity,
             hot_blocks=self.hot_blocks,
         )
+        # Mirror both sides of the directory on device.  A stale
+        # logical->hot entry is harmless because the reverse mapping is the
+        # generation check: a slot is resident only when both mappings agree.
+        # This lets the common all-hot path translate QSA selections without
+        # copying the [query_rows, top_k] matrix to CPU.
+        self._logical_to_hot_device = torch.full(
+            (self.num_layers, self.layout.block_capacity),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._hot_to_logical_device = torch.full(
+            (self.num_layers, self.hot_blocks),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Reused fused-resolver workspace.  Epoch tags compact the selected
+        # logical blocks without sorting or clearing a worst-case bitmap on
+        # every layer.  The list is copied to CPU only on an actual miss.
+        self._resolve_seen_epochs = torch.zeros(
+            (self.num_layers, self.layout.block_capacity),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._resolve_selected_blocks = torch.empty(
+            self.layout.block_capacity, dtype=torch.int32, device=self.device
+        )
+        self._resolve_selected_count = torch.zeros(
+            1, dtype=torch.int32, device=self.device
+        )
+        self._resolve_miss_count = torch.zeros(
+            1, dtype=torch.int32, device=self.device
+        )
+        self._resolve_epochs = [0] * self.num_layers
         self.pool.register_active_kv_coordinator(self)
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=self.device)
         self._ready_reqs = []
@@ -111,6 +148,9 @@ class ActiveSparseQSAKVCoordinator:
         self._read_misses = 0
         self._writes = 0
         self._materialize_calls = 0
+        self._resident_resolve_hits = 0
+        self._resident_resolve_misses = 0
+        self._overlapped_read_batches = 0
         self._log_interval = config.log_interval
         logger.warning(
             "Exact active QSA KV enabled: extent=%s bytes=%d hot_blocks=%d "
@@ -134,6 +174,72 @@ class ActiveSparseQSAKVCoordinator:
     def _local_layer(self, layer_id: int) -> int:
         return int(self.pool._transfer_full_attention_id(int(layer_id)))
 
+    def _publish_device_mapping(
+        self, layer: int, logical_blocks: list[int], hot_blocks: list[int]
+    ) -> None:
+        if not logical_blocks:
+            return
+        logical = torch.tensor(logical_blocks, dtype=torch.int64, device=self.device)
+        hot = torch.tensor(hot_blocks, dtype=torch.int64, device=self.device)
+        self._logical_to_hot_device[layer, logical] = hot.to(torch.int32)
+        self._hot_to_logical_device[layer, hot] = logical.to(torch.int32)
+
+    def _resolve_slots_device(
+        self, layer: int, logical_slots: torch.Tensor
+    ) -> tuple[torch.Tensor, list[int] | None]:
+        logical_i32 = logical_slots.to(torch.int32).contiguous()
+        physical = torch.empty_like(logical_i32)
+        self._resolve_selected_count.zero_()
+        self._resolve_miss_count.zero_()
+        epoch = self._resolve_epochs[layer] + 1
+        if epoch >= 2_147_483_647:
+            self._resolve_seen_epochs[layer].zero_()
+            epoch = 1
+        self._resolve_epochs[layer] = epoch
+        resolve_qsa_slots(
+            logical_slots=logical_i32,
+            logical_to_hot=self._logical_to_hot_device[layer],
+            hot_to_logical=self._hot_to_logical_device[layer],
+            physical_slots=physical,
+            selected_blocks=self._resolve_selected_blocks,
+            seen_epochs=self._resolve_seen_epochs[layer],
+            selected_count=self._resolve_selected_count,
+            miss_count=self._resolve_miss_count,
+            epoch=epoch,
+            block_tokens=self.block_tokens,
+            record_bytes=self.record_bytes,
+        )
+        # This one scalar is the only mandatory GPU->CPU synchronization.  An
+        # all-hot decode/prefill group returns without moving selection data.
+        if int(self._resolve_miss_count.item()) == 0:
+            return physical, None
+        selected_count = int(self._resolve_selected_count.item())
+        selected = (
+            self._resolve_selected_blocks[:selected_count]
+            .to("cpu", dtype=torch.int64)
+            .tolist()
+        )
+        return physical, selected
+
+    def resolve_resident_slots(
+        self, layer_id: int, logical_slots: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Translate selections entirely on GPU when every block is hot.
+
+        The reverse-map comparison detects recycled hot slots without a
+        full logical-map invalidation pass.  A single scalar synchronization
+        decides whether the caller can use the fast path; any miss falls back
+        to the authoritative NVMe materializer.
+        """
+
+        layer = self._local_layer(layer_id)
+        physical, selected = self._resolve_slots_device(layer, logical_slots)
+        if selected is not None:
+            self._resident_resolve_misses += 1
+            return None
+        self._resident_resolve_hits += 1
+        return physical
+
     def prepare_write(
         self, layer_id: int, logical_locs: torch.Tensor
     ) -> ActiveKVWritePlan:
@@ -148,12 +254,13 @@ class ActiveSparseQSAKVCoordinator:
         hot_by_block = {}
         completed = []
         for block, offsets in block_to_offsets.items():
-            hot = self.directory.begin_write(
-                layer, block, starts_block=0 in offsets
-            )
+            hot = self.directory.begin_write(layer, block, starts_block=0 in offsets)
             hot_by_block[block] = hot
             if self.block_tokens - 1 in offsets:
                 completed.append((block, hot))
+        self._publish_device_mapping(
+            layer, list(hot_by_block), list(hot_by_block.values())
+        )
         physical = [
             hot_by_block[int(logical) // self.block_tokens] * self.block_tokens
             + int(logical) % self.block_tokens
@@ -203,23 +310,35 @@ class ActiveSparseQSAKVCoordinator:
         """Return hot physical token slots for global logical KV slots."""
 
         layer = self._local_layer(layer_id)
-        shape = logical_slots.shape
-        logical_cpu = logical_slots.detach().to("cpu", dtype=torch.int64).flatten()
-        valid_slots = [int(slot) for slot in logical_cpu.tolist() if int(slot) >= 0]
-        blocks = tuple(dict.fromkeys(slot // self.block_tokens for slot in valid_slots))
-        placement = self.directory.place(
-            layer, blocks, require_authoritative=True
-        )
+        physical, selected = self._resolve_slots_device(layer, logical_slots)
+        if selected is None:
+            self._resident_resolve_hits += 1
+            return physical
+        self._resident_resolve_misses += 1
+        blocks = tuple(selected)
+        placement = self.directory.place(layer, blocks, require_authoritative=True)
+        if placement.misses:
+            self._publish_device_mapping(
+                layer,
+                [logical for logical, _ in placement.misses],
+                [hot for _, hot in placement.misses],
+            )
         self._reads += len(blocks)
         self._read_misses += len(placement.misses)
         self._materialize_calls += 1
-        for start in range(0, len(placement.misses), self.io.io_depth):
+        bank_ready = [None, None]
+        for batch_index, start in enumerate(
+            range(0, len(placement.misses), self.io.io_depth)
+        ):
             batch = placement.misses[start : start + self.io.io_depth]
+            bank = batch_index % 2
+            if bank_ready[bank] is not None:
+                bank_ready[bank].synchronize()
             offsets = [
                 self.layout.record_offset(layer, logical_block)
                 for logical_block, _ in batch
             ]
-            staging = self.io.read(offsets)
+            staging = self.io.read(offsets, bank=bank)
             destination = torch.tensor(
                 [hot_block for _, hot_block in batch],
                 dtype=torch.int32,
@@ -233,28 +352,23 @@ class ActiveSparseQSAKVCoordinator:
                 num_records=len(batch),
                 block_tokens=self.block_tokens,
             )
-            # The next O_DIRECT batch reuses the fixed staging rows.  Do not let
-            # the drive overwrite a row before CUDA has consumed it.
-            torch.cuda.current_stream(self.device).synchronize()
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self.device))
+            bank_ready[bank] = ready
+            if batch_index:
+                self._overlapped_read_batches += 1
         if self._materialize_calls % self._log_interval == 0:
             logger.info(
                 "Exact active QSA KV metrics after %d materializations: %s",
                 self._materialize_calls,
                 self.cache_metrics(),
             )
-        translated = []
-        for slot in logical_cpu.tolist():
-            if slot < 0:
-                translated.append(-1)
-                continue
-            block = int(slot) // self.block_tokens
-            hot = self.directory.lookup(layer, block)
-            if hot < 0:
-                raise RuntimeError("active-KV block lost placement after materialize")
-            translated.append(hot * self.block_tokens + int(slot) % self.block_tokens)
-        return torch.tensor(
-            translated, dtype=torch.int32, device=logical_slots.device
-        ).reshape(shape)
+        physical, remaining = self._resolve_slots_device(layer, logical_slots)
+        if remaining is not None:
+            raise RuntimeError(
+                "active-KV fused resolver still reports misses after materialization"
+            )
+        return physical
 
     # Scheduler lifecycle compatibility.  Unlike host HiSparse, prefill has
     # already written through and there is no post-prefill staging DMA.
@@ -294,10 +408,7 @@ class ActiveSparseQSAKVCoordinator:
             if logical >= 0
         )
         authoritative = sum(
-            1
-            for layer in self.directory._authoritative
-            for present in layer
-            if present
+            1 for layer in self.directory._authoritative for present in layer if present
         )
         hot_capacity = self.num_layers * self.hot_blocks
         host_capacity = self.num_layers * self.layout.block_capacity
@@ -314,6 +425,11 @@ class ActiveSparseQSAKVCoordinator:
             "read_misses": self._read_misses,
             "hit_rate": 1.0 - self._read_misses / max(self._reads, 1),
             "written_blocks": self._writes,
+            "resident_resolve_hits": self._resident_resolve_hits,
+            "resident_resolve_misses": self._resident_resolve_misses,
+            "page_cache_reads": self.io.buffered_reads,
+            "direct_reads": self.io.direct_reads,
+            "overlapped_read_batches": self._overlapped_read_batches,
         }
 
     def destroy(self) -> None:

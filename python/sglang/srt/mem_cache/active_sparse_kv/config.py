@@ -14,6 +14,7 @@ class ActiveSparseKVConfig:
     max_bytes: int = 0
     min_free_bytes: int = 0
     io_depth: int = 64
+    page_cache_bytes: int = 0
     log_interval: int = 4096
     verify_reads: bool = False
 
@@ -41,6 +42,10 @@ class ActiveSparseKVConfig:
         )
         if io_depth > 4096:
             raise ValueError("active_kv_io_depth must not exceed 4096")
+        page_cache_bytes = _non_negative_int(
+            extra_config.get("active_kv_page_cache_bytes", 0),
+            "active_kv_page_cache_bytes",
+        )
         log_interval = _positive_int(
             extra_config.get("active_kv_log_interval", 4096),
             "active_kv_log_interval",
@@ -55,10 +60,16 @@ class ActiveSparseKVConfig:
                 raise ValueError(
                     "active_kv_max_bytes is required for the NVMe backend"
                 )
-        elif path is not None or max_bytes or min_free_bytes:
+            if page_cache_bytes > max_bytes:
+                raise ValueError(
+                    "active_kv_page_cache_bytes must not exceed "
+                    "active_kv_max_bytes"
+                )
+        elif path is not None or max_bytes or min_free_bytes or page_cache_bytes:
             raise ValueError(
-                "active_kv_path/active_kv_max_bytes/active_kv_min_free_bytes "
-                "are only valid with active_kv_backend='nvme'"
+                "active_kv_path/active_kv_max_bytes/active_kv_min_free_bytes/"
+                "active_kv_page_cache_bytes are only valid with "
+                "active_kv_backend='nvme'"
             )
         return cls(
             backend=backend,
@@ -66,6 +77,7 @@ class ActiveSparseKVConfig:
             max_bytes=max_bytes,
             min_free_bytes=min_free_bytes,
             io_depth=io_depth,
+            page_cache_bytes=page_cache_bytes,
             log_interval=log_interval,
             verify_reads=verify_reads,
         )

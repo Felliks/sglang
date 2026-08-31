@@ -1,8 +1,11 @@
+import fcntl
+import os
 from pathlib import Path
 
 import pytest
 from sglang.srt.mem_cache.active_sparse_kv import (
     ActiveKVBlockDirectory,
+    ActiveKVExtent,
     ActiveSparseKVConfig,
     ActiveSparseKVLayout,
     active_qsa_hot_token_capacity,
@@ -17,11 +20,13 @@ def test_nvme_config_is_explicit_and_bounded() -> None:
             "active_kv_max_bytes": 20 * 1024**3,
             "active_kv_min_free_bytes": 80 * 1024**3,
             "active_kv_io_depth": 64,
+            "active_kv_page_cache_bytes": 512 * 1024**2,
         }
     )
     assert config.path == Path("/var/tmp/active-kv")
     assert config.max_bytes == 20 * 1024**3
     assert config.io_depth == 64
+    assert config.page_cache_bytes == 512 * 1024**2
 
 
 @pytest.mark.parametrize(
@@ -31,11 +36,18 @@ def test_nvme_config_is_explicit_and_bounded() -> None:
         {"active_kv_backend": "nvme", "active_kv_path": "/tmp/x"},
         {"active_kv_backend": "unknown"},
         {"active_kv_backend": "host", "active_kv_path": "/tmp/x"},
+        {"active_kv_backend": "host", "active_kv_page_cache_bytes": 4096},
         {
             "active_kv_backend": "nvme",
             "active_kv_path": "/tmp/x",
             "active_kv_max_bytes": 1,
             "active_kv_io_depth": 0,
+        },
+        {
+            "active_kv_backend": "nvme",
+            "active_kv_path": "/tmp/x",
+            "active_kv_max_bytes": 4096,
+            "active_kv_page_cache_bytes": 8192,
         },
     ],
 )
@@ -108,3 +120,31 @@ def test_block_directory_refuses_to_evict_only_partial_blocks() -> None:
     directory.begin_write(0, 1, starts_block=True)
     with pytest.raises(RuntimeError, match="exhausted by pinned"):
         directory.begin_write(0, 2, starts_block=True)
+
+
+def test_block_directory_protects_later_hits_before_allocating_misses() -> None:
+    directory = ActiveKVBlockDirectory(num_layers=1, logical_blocks=8, hot_blocks=2)
+    directory.place(0, [0, 1], require_authoritative=False)
+    placement = directory.place(0, [2, 0], require_authoritative=False)
+    assert len(placement.misses) == 1
+    assert directory.lookup(0, 0) >= 0
+    assert directory.lookup(0, 1) == -1
+
+
+def test_extent_reclaims_only_unlocked_crash_artifacts(tmp_path: Path) -> None:
+    stale = tmp_path / "active-kv-rank9-pid999999.bin"
+    stale.write_bytes(b"stale")
+    live = tmp_path / "active-kv-rank8-pid888888.bin"
+    live_fd = os.open(live, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    config = ActiveSparseKVConfig(
+        backend="nvme", path=tmp_path, max_bytes=1024 * 1024
+    )
+    layout = ActiveSparseKVLayout(1, 4, 4, 4, 4096)
+    try:
+        extent = ActiveKVExtent(config, layout, rank=0)
+        assert not stale.exists()
+        assert live.exists()
+        extent.close()
+    finally:
+        os.close(live_fd)
