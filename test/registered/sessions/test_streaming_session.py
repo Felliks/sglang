@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=811, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=264, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=811, suite="stage-b-test-1-gpu-large-amd")
 
 
