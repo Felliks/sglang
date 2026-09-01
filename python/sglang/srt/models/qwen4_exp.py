@@ -4,8 +4,9 @@ import json
 import math
 import os
 import time
-from pathlib import Path
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import msgspec
@@ -14,8 +15,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
@@ -66,6 +65,7 @@ from sglang.srt.models.qwen3_5 import (
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
+from torch import nn
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -926,6 +926,13 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
         self._log_interval = int(
             os.environ.get("SGLANG_QWEN4_PLE_LOG_INTERVAL", "256")
         )
+        self._phase_metrics_enabled = os.environ.get(
+            "SGLANG_QWEN4_PLE_PHASE_METRICS", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._disk_reclaim_interval = max(
+            0,
+            int(os.environ.get("SGLANG_QWEN4_PLE_DISK_RECLAIM_INTERVAL", "0")),
+        )
 
         # Keep a named parameter so SGLang's generic loader retains its normal
         # parameter topology. PLE shards are intercepted in load_weights and
@@ -956,6 +963,15 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
         self._hits = 0
         self._lookups = 0
         self._latency_ms = []
+        self._read_rows = 0
+        self._large_lookup_calls = 0
+        self._phase_totals_ms = {
+            "ids_d2h": 0.0,
+            "lookup": 0.0,
+            "rows_h2d": 0.0,
+            "reclaim": 0.0,
+        }
+        self._phase_max_ms = dict.fromkeys(self._phase_totals_ms, 0.0)
 
     def _ensure_open(self) -> None:
         if self._mapped is not None:
@@ -1013,11 +1029,13 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
                 dtype=torch.uint8,
             )
         logger.info(
-            "Qwen4 PLE disk cache opened: path=%s rows=%d dim=%d cache_bytes=%d",
+            "Qwen4 PLE disk cache opened: path=%s rows=%d dim=%d "
+            "cache_bytes=%d reclaim_interval=%d",
             self._raw_path,
             self._rows,
             self.embedding_dim,
             0 if self._cache is None else self._cache.numel(),
+            self._disk_reclaim_interval,
         )
 
     def validate_shard(
@@ -1064,10 +1082,22 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             slot = set_id * self._cache_ways + way
             stage[output_row].copy_(self._cache[slot])
 
-    def _report_stats(self, elapsed_ms: float, lookups: int) -> None:
+    def _report_stats(
+        self,
+        elapsed_ms: float,
+        lookups: int,
+        read_rows: int,
+        phase_ms: Optional[dict[str, float]] = None,
+    ) -> None:
         self._calls += 1
         self._lookups += lookups
+        self._read_rows += read_rows
         self._latency_ms.append(elapsed_ms)
+        if self._phase_metrics_enabled and phase_ms is not None:
+            for name in self._phase_totals_ms:
+                value = phase_ms[name]
+                self._phase_totals_ms[name] += value
+                self._phase_max_ms[name] = max(self._phase_max_ms[name], value)
         if len(self._latency_ms) > 2048:
             del self._latency_ms[:1024]
         if self._log_interval <= 0 or self._calls % self._log_interval:
@@ -1084,6 +1114,27 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             elapsed_ms,
             p95,
         )
+        if self._phase_metrics_enabled:
+            average = {
+                name: value / self._calls
+                for name, value in self._phase_totals_ms.items()
+            }
+            logger.info(
+                "Qwen4 PLE phase stats: calls=%d read_rows=%d read_mib=%.2f "
+                "avg_ms={ids_d2h=%.3f,lookup=%.3f,rows_h2d=%.3f,reclaim=%.3f} "
+                "max_ms={ids_d2h=%.3f,lookup=%.3f,rows_h2d=%.3f,reclaim=%.3f}",
+                self._calls,
+                self._read_rows,
+                self._read_rows * self.embedding_dim / (1024 * 1024),
+                average["ids_d2h"],
+                average["lookup"],
+                average["rows_h2d"],
+                average["reclaim"],
+                self._phase_max_ms["ids_d2h"],
+                self._phase_max_ms["lookup"],
+                self._phase_max_ms["rows_h2d"],
+                self._phase_max_ms["reclaim"],
+            )
 
     def gather(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
@@ -1108,6 +1159,7 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             return output
         self._ensure_open()
         started = time.perf_counter()
+        ids_d2h_started = time.perf_counter()
         host_ids = torch.empty(
             flat_ids.shape,
             dtype=torch.int64,
@@ -1121,7 +1173,9 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             raise IndexError(
                 f"PLE row outside [0, {self._rows}): [{int(low)}, {int(high)}]"
             )
+        ids_d2h_ms = (time.perf_counter() - ids_d2h_started) * 1000.0
 
+        lookup_started = time.perf_counter()
         stage = torch.empty(
             (host_ids.numel(), self.embedding_dim),
             dtype=torch.uint8,
@@ -1129,10 +1183,15 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             pin_memory=True,
         )
         if self._cache is not None and host_ids.numel() <= self._cache_max_lookup_rows:
+            hits_before = self._hits
             self._gather_cached(host_ids, stage)
+            read_rows = host_ids.numel() - (self._hits - hits_before)
         else:
             torch.index_select(self._mapped, 0, host_ids, out=stage)
+            read_rows = host_ids.numel()
+        lookup_ms = (time.perf_counter() - lookup_started) * 1000.0
 
+        rows_h2d_started = time.perf_counter()
         gpu_stage = torch.empty(
             stage.shape,
             dtype=self._storage_dtype,
@@ -1147,16 +1206,34 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
         # The launch config therefore uses eager decode, and this stream-local
         # barrier keeps pinned staging buffers alive until both copies finish.
         current_stream.synchronize()
+        rows_h2d_ms = (time.perf_counter() - rows_h2d_started) * 1000.0
+        reclaim_started = time.perf_counter()
+        if host_ids.numel() > self._cache_max_lookup_rows:
+            self._large_lookup_calls += 1
+            if (
+                self._disk_reclaim_interval > 0
+                and self._large_lookup_calls % self._disk_reclaim_interval == 0
+                and self._fd is not None
+                and hasattr(os, "posix_fadvise")
+            ):
+                # Page-cache residency is valuable for repeated agent/tool
+                # prefixes and remains reclaimable by the kernel/cgroup under
+                # real memory pressure.  Explicit eviction is therefore an
+                # opt-in safety policy instead of an unconditional hot-path
+                # cost after every large prefill gather.
+                os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        reclaim_ms = (time.perf_counter() - reclaim_started) * 1000.0
         self._report_stats(
             (time.perf_counter() - started) * 1000.0,
             host_ids.numel(),
+            read_rows,
+            {
+                "ids_d2h": ids_d2h_ms,
+                "lookup": lookup_ms,
+                "rows_h2d": rows_h2d_ms,
+                "reclaim": reclaim_ms,
+            },
         )
-        if (
-            host_ids.numel() > self._cache_max_lookup_rows
-            and self._fd is not None
-            and hasattr(os, "posix_fadvise")
-        ):
-            os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_DONTNEED)
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
@@ -1246,6 +1323,26 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_stream = (
             torch.cuda.Stream() if config.ple_offload_embedding else None
         )
+        self._disk_prefetch_executor = None
+        self._disk_prefetch_timeout_seconds = float(
+            os.environ.get("SGLANG_QWEN4_PLE_ASYNC_TIMEOUT_SECONDS", "60")
+        )
+        if (
+            isinstance(
+                self.ple_embedding.ngram_embedding, Qwen4ExpDiskCachedEmbedding
+            )
+            and os.environ.get("SGLANG_QWEN4_PLE_ASYNC_WORKER", "0").lower()
+            in ("1", "true", "yes", "on")
+        ):
+            # Disk-backed gather must wait for GPU-produced n-gram IDs before
+            # touching mmap rows.  Doing that wait on the scheduler thread
+            # serializes the supposedly prefetched lookup with the preceding
+            # decoder layer.  One worker is enough because a PLE layer permits
+            # only one in-flight lookup and preserves submission order.
+            self._disk_prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"qwen4-ple-{ple_layer_index}",
+            )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
@@ -1439,16 +1536,34 @@ class Qwen4ExpPLELayer(nn.Module):
         stream = self._prefetch_stream
         stream.wait_stream(torch.cuda.current_stream())
         lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
-            offloaded_embedding.gather(lookup_ids, out=output_view)
-        self._prefetch_state = prefetched, semantic_tokens, physical_tokens
+
+        def gather_on_prefetch_stream() -> None:
+            with torch.cuda.device(lookup_ids.device), torch.cuda.stream(stream):
+                offloaded_embedding.gather(lookup_ids, out=output_view)
+
+        future: Optional[Future] = None
+        if self._disk_prefetch_executor is not None:
+            future = self._disk_prefetch_executor.submit(gather_on_prefetch_stream)
+        else:
+            gather_on_prefetch_stream()
+        self._prefetch_state = (
+            prefetched,
+            semantic_tokens,
+            physical_tokens,
+            future,
+        )
 
     def _consume_prefetched_embeddings(
         self, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
-        embeddings, semantic_tokens, physical_tokens = self._prefetch_state
+        embeddings, semantic_tokens, physical_tokens, future = self._prefetch_state
+        self._prefetch_state = None
+        if future is not None:
+            # Fail closed instead of leaving the scheduler blocked forever if
+            # the storage worker or CUDA stream stops making progress.
+            future.result(timeout=self._disk_prefetch_timeout_seconds)
         torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
@@ -1458,7 +1573,6 @@ class Qwen4ExpPLELayer(nn.Module):
             forward_batch,
             physical_tokens,
         )
-        self._prefetch_state = None
         return embeddings
 
     def forward(
