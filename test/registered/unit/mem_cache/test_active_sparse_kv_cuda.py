@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,9 @@ from sglang.srt.mem_cache.active_sparse_kv import (
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention_reference
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
+)
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QwenSparseAttnBackend,
 )
 
 
@@ -62,6 +66,24 @@ class _MockAllocator:
 
     def get_kvcache(self):
         return self.pool
+
+
+class _TargetVerifyMode:
+    @staticmethod
+    def is_target_verify() -> bool:
+        return True
+
+
+def test_target_verify_row_mapping_is_shape_only() -> None:
+    forward_batch = SimpleNamespace(
+        req_pool_indices=torch.tensor([7, 9], dtype=torch.int32),
+        # Deliberately not a tensor: the uniform target-verify path must not
+        # inspect or synchronize the device-side extend lengths.
+        extend_seq_lens=object(),
+        forward_mode=_TargetVerifyMode(),
+    )
+    rows = QwenSparseAttnBackend._speculative_row_to_request(forward_batch, 8)
+    torch.testing.assert_close(rows, torch.tensor([0] * 4 + [1] * 4))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -202,3 +224,38 @@ def test_chunk_prefill_accepts_absolute_hot_slots() -> None:
     )
     expected = qsa_sparse_attention_reference(q, k, v, slots, scale)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_static_single_row_sparse_gqa_masks_padding_without_sync() -> None:
+    torch.manual_seed(11)
+    rows, q_heads, kv_heads, dim = 4, 8, 2, 256
+    q = torch.randn(rows, q_heads, dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(32, kv_heads, dim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    slots = torch.full((rows, 64), -1, dtype=torch.int32, device="cuda")
+    visible = [0, 7, 16, 31]
+    for row, count in enumerate(visible):
+        slots[row, :count] = torch.randperm(32, device="cuda")[:count]
+
+    # One query per logical row gives a host-known max_q=1 and absolute hot
+    # slots (cu_k is all zero).  No dynamic valid-count tensor reaches Python.
+    cu_q = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+    cu_k = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor(visible, dtype=torch.int32, device="cuda")
+    scale = dim**-0.5
+    actual = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        k,
+        v,
+        slots,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        max_q=1,
+    )
+    expected = qsa_sparse_attention_reference(q, k, v, slots, scale)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[0]) == 0

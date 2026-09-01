@@ -111,7 +111,13 @@ def _sparse_gqa_prefill(
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    # A fully padded row is legal during graph warmup and DP padding.  Keep
+    # its result defined without a host-side valid-count query.
+    output = tl.where(
+        normalizer[:, None] > 0,
+        accumulator / normalizer[:, None],
+        0.0,
+    )
     tl.store(
         out
         + query * so_m
@@ -252,7 +258,13 @@ def _sparse_gqa_chunk_prefill(
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    # Keep graph-padding rows defined without asking the host how many slots
+    # survived the device-side validity mask.
+    output = tl.where(
+        normalizer[:, None] > 0,
+        accumulator / normalizer[:, None],
+        0.0,
+    )
     tl.store(
         out
         + query * so_m
@@ -263,12 +275,29 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    *,
+    max_q: Optional[int] = None,
+):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    if max_q is None:
+        # Chunk-prefill callers have variable per-request query lengths.  A
+        # caller with a host-known static layout can pass max_q and avoid this
+        # otherwise unavoidable device-to-host synchronization.
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    elif max_q < 0:
+        raise ValueError(f"max_q must be non-negative, got {max_q}")
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)

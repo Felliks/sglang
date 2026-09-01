@@ -248,6 +248,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._sm121_single_row_tables: Dict[
+            Tuple[int, torch.device], Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -311,6 +314,21 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
         if extend_seq_lens is not None:
+            # Target verification has a uniform, shape-known chain layout.
+            # Reading sum(extend_seq_lens) with .item() here used to serialize
+            # every QSA layer with the GPU.  Map the rows arithmetically; DP
+            # padding is already represented by physical rows in num_rows.
+            if forward_batch.forward_mode.is_target_verify():
+                if num_rows % batch_size != 0:
+                    raise ValueError(
+                        "QSA target-verify rows cannot be mapped uniformly: "
+                        f"rows={num_rows}, batch={batch_size}"
+                    )
+                return torch.arange(
+                    batch_size,
+                    dtype=torch.long,
+                    device=forward_batch.req_pool_indices.device,
+                ).repeat_interleave(num_rows // batch_size)
             # Draft-extend carries the accepted length per request.  DP batch
             # padding appends zero-length request rows, and DP token padding
             # appends trailing token rows that belong to no request; alias
@@ -1751,38 +1769,47 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         physical_slots: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Packed sparse decode without flash-attn-4's broken SM121 varlen path."""
+        """Sync-free sparse GQA over absolute SM121 hot-cache slots.
+
+        Boolean tensor indexing materializes ``nonzero`` and synchronizes the
+        host once per query row.  QSA already has a fixed-width slot matrix
+        with ``-1`` padding, so the chunk kernel can consume that matrix
+        directly and mask padding in-kernel.  Treating each query row as a
+        one-token sequence keeps the launch shape static for decode and
+        speculative verification.
+        """
         if physical_slots is None:
             if topk_indices is None:
                 raise ValueError("QSA SM121 sparse attention needs selected slots")
             slots = self._logical_to_physical(topk_indices, metadata)
         else:
             slots = physical_slots
-        repeats = q.shape[1] // k_buffer.shape[1]
-        outputs = []
-        for row in range(q.shape[0]):
-            valid_slots = slots[row, slots[row] >= 0].long()
-            if valid_slots.numel() == 0:
-                outputs.append(torch.zeros_like(q[row]))
-                continue
-            keys = k_buffer.index_select(0, valid_slots).repeat_interleave(
-                repeats, dim=1
+        rows = q.shape[0]
+        key = (rows, q.device)
+        tables = self._sm121_single_row_tables.get(key)
+        if tables is None:
+            tables = (
+                torch.arange(rows + 1, dtype=torch.int32, device=q.device),
+                torch.zeros(rows + 1, dtype=torch.int32, device=q.device),
             )
-            values = v_buffer.index_select(0, valid_slots).repeat_interleave(
-                repeats, dim=1
+            self._sm121_single_row_tables[key] = tables
+        cu_q, cu_k = tables
+        row_lengths = metadata.sequence_lengths
+        if row_lengths.numel() != rows:
+            row_lengths = row_lengths.index_select(
+                0, metadata.token_to_batch_idx.long()
             )
-            query = q[row].unsqueeze(0).unsqueeze(2)
-            keys = keys.permute(1, 0, 2).unsqueeze(0)
-            values = values.permute(1, 0, 2).unsqueeze(0)
-            output = F.scaled_dot_product_attention(
-                query,
-                keys,
-                values,
-                is_causal=False,
-                scale=layer.scaling,
-            )
-            outputs.append(output[0, :, 0, :])
-        return torch.stack(outputs).reshape(q.shape[0], -1)
+        return sparse_gqa_fwd_interface_triton_ck(
+            q.contiguous(),
+            k_buffer,
+            v_buffer,
+            slots.to(torch.int32).contiguous(),
+            cu_q,
+            cu_k,
+            row_lengths.to(torch.int32).contiguous(),
+            layer.scaling,
+            max_q=1,
+        ).reshape(rows, -1)
 
     def forward_decode(
         self,
