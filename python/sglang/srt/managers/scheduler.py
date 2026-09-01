@@ -340,6 +340,38 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _decode_aware_chunked_prefill_size(
+    chunked_prefill_size: Optional[int],
+    chunked_prefill_size_when_decode: Optional[int],
+    running_bs: int,
+) -> Optional[int]:
+    """Select a per-batch budget without changing activation-buffer sizing."""
+
+    if (
+        running_bs > 0
+        and chunked_prefill_size_when_decode is not None
+        and chunked_prefill_size is not None
+    ):
+        return min(chunked_prefill_size, chunked_prefill_size_when_decode)
+    return chunked_prefill_size
+
+
+def _should_prioritize_decode(
+    decode_steps_until_prefill: int,
+    decode_steps_per_prefill: Optional[int],
+    has_running_decode: bool,
+    has_pending_prefill: bool,
+) -> bool:
+    """Bound prefill-first starvation when mixed chunks cannot be used."""
+
+    return (
+        decode_steps_per_prefill is not None
+        and decode_steps_until_prefill > 0
+        and has_running_decode
+        and has_pending_prefill
+    )
+
+
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
     torch.distributed.all_reduce(warmup_tensor, group=group)
@@ -1155,6 +1187,11 @@ class Scheduler(
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
+        self.chunked_prefill_size_when_decode = (
+            get_schedule().chunked_prefill_size_when_decode
+        )
+        self.decode_steps_per_prefill = get_schedule().decode_steps_per_prefill
+        self._decode_steps_until_prefill = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -3147,8 +3184,23 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        has_running_decode = (
+            not running_batch.is_empty() and not running_batch.is_prefill_only
+        )
+        has_pending_prefill = self.chunked_req is not None or bool(self.waiting_queue)
+        prioritize_decode = _should_prioritize_decode(
+            self._decode_steps_until_prefill,
+            self.decode_steps_per_prefill,
+            has_running_decode,
+            has_pending_prefill,
+        )
+        if not has_running_decode or not has_pending_prefill:
+            self._decode_steps_until_prefill = 0
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif prioritize_decode:
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -3170,11 +3222,15 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            if has_running_decode and self.decode_steps_per_prefill is not None:
+                self._decode_steps_until_prefill = self.decode_steps_per_prefill
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
+                if prioritize_decode and ret is not None:
+                    self._decode_steps_until_prefill -= 1
             else:
                 ret = None
 
@@ -3291,6 +3347,11 @@ class Scheduler(
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        chunked_prefill_size = _decode_aware_chunked_prefill_size(
+            chunked_prefill_size,
+            self.chunked_prefill_size_when_decode,
+            running_bs,
+        )
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic

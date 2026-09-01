@@ -804,6 +804,25 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    chunked_prefill_size_when_decode: A[
+        Optional[int],
+        (
+            "Optional smaller chunked-prefill budget used while requests are "
+            "already decoding. The regular --chunked-prefill-size remains the "
+            "allocation and idle-throughput ceiling. This bounds decode stalls "
+            "without forcing cold idle prefills to use tiny chunks."
+        ),
+        NS("schedule"),
+    ] = None
+    decode_steps_per_prefill: A[
+        Optional[int],
+        (
+            "When set, run this many decode batches after each chunked-prefill "
+            "batch while decode requests are active. This bounds prefill-first "
+            "starvation for speculative decoders that cannot use mixed chunks."
+        ),
+        NS("schedule"),
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -9355,6 +9374,29 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+        if self.chunked_prefill_size_when_decode is not None:
+            assert self.chunked_prefill_size > 0, (
+                "chunked_prefill_size_when_decode requires chunked prefill"
+            )
+            assert self.chunked_prefill_size_when_decode > 0, (
+                "chunked_prefill_size_when_decode must be positive"
+            )
+            assert (
+                self.chunked_prefill_size_when_decode <= self.chunked_prefill_size
+            ), (
+                "chunked_prefill_size_when_decode must not exceed "
+                "chunked_prefill_size"
+            )
+            assert self.chunked_prefill_size_when_decode % self.page_size == 0, (
+                "chunked_prefill_size_when_decode must be divisible by page_size"
+            )
+        if self.decode_steps_per_prefill is not None:
+            assert self.chunked_prefill_size > 0, (
+                "decode_steps_per_prefill requires chunked prefill"
+            )
+            assert self.decode_steps_per_prefill > 0, (
+                "decode_steps_per_prefill must be positive"
+            )
 
         # Check pdmux
         if self.enable_pdmux:
