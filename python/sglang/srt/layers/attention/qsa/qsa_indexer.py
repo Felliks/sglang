@@ -28,6 +28,33 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
 # row tiles without changing the selected blocks.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+def _ensure_rope_cache_covers_positions(rotary_emb, positions: torch.Tensor) -> None:
+    """Grow a partial RoPE cache without synchronizing a complete static cache.
+
+    RotaryEmbedding eagerly builds ``max_position_embeddings`` rows.  Requests
+    accepted by the engine cannot exceed that configured context, so reading a
+    CUDA ``positions.max().item()`` on every QSA layer is redundant when the
+    complete table is still present.  Keep the old dynamic-growth path for
+    shortened/custom caches and context-overwrite configurations.
+    """
+    ensure_length = getattr(rotary_emb, "_ensure_cos_sin_cache_length", None)
+    if ensure_length is None:
+        return
+
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    configured_length = getattr(rotary_emb, "max_position_embeddings", None)
+    if (
+        cache is not None
+        and configured_length is not None
+        and int(cache.shape[0]) >= int(configured_length)
+    ):
+        return
+
+    ensure_length(int(positions.max().item()))
+
+
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
@@ -182,9 +209,7 @@ class QSAIndexer(MultiPlatformOp):
             if not get_is_capture_mode() and hasattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+                _ensure_rope_cache_covers_positions(self.rotary_emb, positions)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -411,8 +436,8 @@ class QSAIndexer(MultiPlatformOp):
         num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+        if not get_is_capture_mode():
+            _ensure_rope_cache_covers_positions(self.rotary_emb, positions)
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the
