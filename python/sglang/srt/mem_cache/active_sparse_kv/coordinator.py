@@ -150,6 +150,8 @@ class ActiveSparseQSAKVCoordinator:
         self._materialize_calls = 0
         self._resident_resolve_hits = 0
         self._resident_resolve_misses = 0
+        self._planner_probes = 0
+        self._planner_groups = 0
         self._overlapped_read_batches = 0
         self._log_interval = config.log_interval
         logger.warning(
@@ -187,6 +189,22 @@ class ActiveSparseQSAKVCoordinator:
     def _resolve_slots_device(
         self, layer: int, logical_slots: torch.Tensor
     ) -> tuple[torch.Tensor, list[int] | None]:
+        physical = self._launch_slot_resolver(layer, logical_slots)
+        # This one scalar is the only mandatory GPU->CPU synchronization.  An
+        # all-hot decode/prefill group returns without moving selection data.
+        if int(self._resolve_miss_count.item()) == 0:
+            return physical, None
+        selected_count = int(self._resolve_selected_count.item())
+        selected = (
+            self._resolve_selected_blocks[:selected_count]
+            .to("cpu", dtype=torch.int64)
+            .tolist()
+        )
+        return physical, selected
+
+    def _launch_slot_resolver(
+        self, layer: int, logical_slots: torch.Tensor
+    ) -> torch.Tensor:
         logical_i32 = logical_slots.to(torch.int32).contiguous()
         physical = torch.empty_like(logical_i32)
         self._resolve_selected_count.zero_()
@@ -209,17 +227,55 @@ class ActiveSparseQSAKVCoordinator:
             block_tokens=self.block_tokens,
             record_bytes=self.record_bytes,
         )
-        # This one scalar is the only mandatory GPU->CPU synchronization.  An
-        # all-hot decode/prefill group returns without moving selection data.
-        if int(self._resolve_miss_count.item()) == 0:
-            return physical, None
-        selected_count = int(self._resolve_selected_count.item())
-        selected = (
-            self._resolve_selected_blocks[:selected_count]
-            .to("cpu", dtype=torch.int64)
-            .tolist()
-        )
-        return physical, selected
+        return physical
+
+    def _selected_block_count(self, layer: int, logical_slots: torch.Tensor) -> int:
+        self._launch_slot_resolver(layer, logical_slots)
+        self._planner_probes += 1
+        return int(self._resolve_selected_count.item())
+
+    def materialization_group_end(
+        self,
+        layer_id: int,
+        logical_slots: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> int:
+        """Find the largest exact row prefix whose block union fits hot KV.
+
+        The unique-block reduction stays on CUDA.  Only one scalar count per
+        probe crosses to the scheduler process, replacing the former
+        ``[rows, top_k]`` CPU copy and Python ``set`` walk on every QSA layer.
+        """
+
+        if not 0 <= start < end <= logical_slots.shape[0]:
+            raise ValueError(
+                f"invalid materialization row range [{start}, {end}) for "
+                f"{logical_slots.shape[0]} rows"
+            )
+        layer = self._local_layer(layer_id)
+        capacity = self.materialization_block_capacity
+        if self._selected_block_count(layer, logical_slots[start:end]) <= capacity:
+            self._planner_groups += 1
+            return end
+
+        low = start + 1
+        high = end - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if (
+                self._selected_block_count(layer, logical_slots[start:middle])
+                <= capacity
+            ):
+                low = middle
+            else:
+                high = middle - 1
+        if self._selected_block_count(layer, logical_slots[start:low]) > capacity:
+            raise RuntimeError(
+                "one QSA query row exceeds the active-KV materialization capacity"
+            )
+        self._planner_groups += 1
+        return low
 
     def resolve_resident_slots(
         self, layer_id: int, logical_slots: torch.Tensor
@@ -427,6 +483,8 @@ class ActiveSparseQSAKVCoordinator:
             "written_blocks": self._writes,
             "resident_resolve_hits": self._resident_resolve_hits,
             "resident_resolve_misses": self._resident_resolve_misses,
+            "planner_probes": self._planner_probes,
+            "planner_groups": self._planner_groups,
             "page_cache_reads": self.io.buffered_reads,
             "direct_reads": self.io.direct_reads,
             "overlapped_read_batches": self._overlapped_read_batches,

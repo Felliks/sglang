@@ -1427,8 +1427,6 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lens,
                 layer.scaling,
             ).reshape(q.shape[0], -1)
-        logical_cpu = logical_slots.detach().to("cpu", dtype=torch.int64)
-        capacity = coordinator.materialization_block_capacity
         extend_lens = [int(length) for length in forward_batch.extend_seq_lens_cpu]
         sequence_lens = [int(length) for length in forward_batch.seq_lens_cpu]
         prefix_lens = [
@@ -1442,40 +1440,31 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
 
         # A group may not cross a request boundary: the chunk-prefill kernel
-        # derives each row's causal limit from one sequence length.  Within a
-        # request, split only when the selected-block union no longer fits the
-        # bounded hot cache.
+        # derives each row's causal limit from one sequence length.  The
+        # coordinator finds maximal capacity-safe row ranges with a fused CUDA
+        # unique-block reduction; the full top-k matrix never crosses to CPU.
         groups = []
         sequence_start = 0
         for sequence_index, extend_len in enumerate(extend_lens):
             sequence_end = sequence_start + extend_len
             group_start = sequence_start
-            group_blocks = set()
-            for row in range(sequence_start, sequence_end):
-                row_blocks = {
-                    int(slot) // coordinator.block_tokens
-                    for slot in logical_cpu[row].tolist()
-                    if int(slot) >= 0
-                }
-                if group_blocks and len(group_blocks | row_blocks) > capacity:
-                    groups.append(
-                        (
-                            group_start,
-                            row,
-                            prefix_lens[sequence_index] + row - sequence_start,
-                        )
-                    )
-                    group_start = row
-                    group_blocks = set()
-                group_blocks.update(row_blocks)
-            if group_start < sequence_end:
+            while group_start < sequence_end:
+                group_end = coordinator.materialization_group_end(
+                    layer.layer_id,
+                    logical_slots,
+                    group_start,
+                    sequence_end,
+                )
                 groups.append(
                     (
                         group_start,
-                        sequence_end,
-                        prefix_lens[sequence_index] + extend_len,
+                        group_end,
+                        prefix_lens[sequence_index]
+                        + group_end
+                        - sequence_start,
                     )
                 )
+                group_start = group_end
             sequence_start = sequence_end
 
         outputs = []

@@ -145,6 +145,44 @@ def test_cuda_nvme_write_evict_read_roundtrip(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_materialization_group_planner_stays_capacity_safe(
+    tmp_path: Path,
+) -> None:
+    if not os.environ.get("SGLANG_ACTIVE_KV_IO_URING_LIBRARY"):
+        pytest.skip("active-KV io_uring helper is not configured")
+    pool = _MockHybridPool()
+    coordinator = ActiveSparseQSAKVCoordinator(
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=_MockAllocator(pool),
+        config=ActiveSparseKVConfig(
+            backend="nvme",
+            path=tmp_path,
+            max_bytes=1024 * 1024,
+            io_depth=4,
+        ),
+        device="cuda",
+        rank=0,
+        max_running_requests=1,
+    )
+    try:
+        # The mock leaves one block for materialization. Row zero selects block
+        # zero; rows one and two select block one. The CUDA planner must split
+        # before row one, then keep the two overlapping rows together.
+        logical = torch.tensor(
+            [[0, 1, -1], [4, 5, -1], [6, 7, -1]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        assert coordinator.materialization_group_end(0, logical, 0, 3) == 1
+        assert coordinator.materialization_group_end(0, logical, 1, 3) == 3
+        metrics = coordinator.cache_metrics()
+        assert metrics["planner_groups"] == 2
+        assert metrics["planner_probes"] >= 3
+    finally:
+        coordinator.destroy()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_prefill_accepts_absolute_hot_slots() -> None:
     torch.manual_seed(7)
     rows, q_heads, kv_heads, dim = 4, 8, 2, 256
