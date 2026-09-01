@@ -63,6 +63,11 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_exp_ple_table import (
+    check_file_backend_supported,
+    make_ple_file_prefetcher,
+    make_ple_file_rss_trimmer,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 from torch import nn
@@ -933,6 +938,11 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             0,
             int(os.environ.get("SGLANG_QWEN4_PLE_DISK_RECLAIM_INTERVAL", "0")),
         )
+        self._zero_copy = os.environ.get(
+            "SGLANG_QWEN4_PLE_ZERO_COPY", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        if self._zero_copy:
+            check_file_backend_supported(torch.cuda.current_device())
 
         # Keep a named parameter so SGLang's generic loader retains its normal
         # parameter topology. PLE shards are intercepted in load_weights and
@@ -954,6 +964,8 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
 
         self._mapped = None
         self._fd = None
+        self._file_prefetcher = None
+        self._file_rss_trimmer = None
         self._cache = None
         self._cache_tags = None
         self._cache_cursor = None
@@ -1005,11 +1017,19 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             size=expected_bytes,
             dtype=torch.uint8,
         ).view(self._rows, self.embedding_dim)
+        if self._zero_copy:
+            # GB10 exposes pageable host mappings through the GPU page tables,
+            # so the existing Triton gather can dereference the mmap directly.
+            # This removes the CPU index_select and pageable/pinned H2D copy
+            # while preserving the checkpoint's exact FP8 bytes and scale.
+            self._mapped._sglang_ple_file_path = self._raw_path
+            self._file_prefetcher = make_ple_file_prefetcher(self._mapped)
+            self._file_rss_trimmer = make_ple_file_rss_trimmer(self._mapped)
         self._fd = os.open(self._raw_path, os.O_RDONLY)
         if hasattr(os, "posix_fadvise"):
             os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_RANDOM)
 
-        cache_rows = self._cache_bytes // self.embedding_dim
+        cache_rows = 0 if self._zero_copy else self._cache_bytes // self.embedding_dim
         cache_rows -= cache_rows % self._cache_ways
         if cache_rows >= self._cache_ways:
             self._cache_sets = cache_rows // self._cache_ways
@@ -1030,12 +1050,13 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             )
         logger.info(
             "Qwen4 PLE disk cache opened: path=%s rows=%d dim=%d "
-            "cache_bytes=%d reclaim_interval=%d",
+            "cache_bytes=%d reclaim_interval=%d zero_copy=%s",
             self._raw_path,
             self._rows,
             self.embedding_dim,
             0 if self._cache is None else self._cache.numel(),
             self._disk_reclaim_interval,
+            self._zero_copy,
         )
 
     def validate_shard(
@@ -1159,6 +1180,33 @@ class Qwen4ExpDiskCachedEmbedding(VocabParallelEmbedding):
             return output
         self._ensure_open()
         started = time.perf_counter()
+        if self._zero_copy:
+            prefetch_started = time.perf_counter()
+            if self._file_prefetcher is not None:
+                self._file_prefetcher.enqueue(flat_ids)
+            prefetch_ms = (time.perf_counter() - prefetch_started) * 1000.0
+            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                self._mapped.data_ptr(),
+                flat_ids,
+                output,
+                embedding_dim=self.embedding_dim,
+                tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                is_fp8=True,
+                BLOCK_D=triton.next_power_of_2(self.embedding_dim),
+            )
+            self._report_stats(
+                (time.perf_counter() - started) * 1000.0,
+                flat_ids.numel(),
+                flat_ids.numel(),
+                {
+                    "ids_d2h": prefetch_ms,
+                    "lookup": 0.0,
+                    "rows_h2d": 0.0,
+                    "reclaim": 0.0,
+                },
+            )
+            return output
         ids_d2h_started = time.perf_counter()
         host_ids = torch.empty(
             flat_ids.shape,
