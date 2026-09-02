@@ -1876,10 +1876,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 physical_slots=physical_slots,
             )
-        if is_sm121():
-            return self._forward_sm121_sdpa_sparse(
-                q, k_buffer, v_buffer, layer, metadata, topk_indices
-            )
+        # GPU-resident SM121 KV must use the upstream-qualified packed KDA
+        # kernel selected by _resolve_flash_attn_varlen_func().  The former
+        # direct gather kernel is kept only for the experimental active-KV
+        # coordinator above, whose translated hot-cache slots cannot be
+        # reconstructed through req_to_token_pool.
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
