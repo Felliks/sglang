@@ -16,6 +16,7 @@ import torch
 try:
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         _require_entry_contiguous_dst,
+        fused_commit_track_indices,
         fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
     )
@@ -23,6 +24,7 @@ try:
     _FUSED_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
     _require_entry_contiguous_dst = None
+    fused_commit_track_indices = None
     fused_conv_window_scatter_with_mask = None
     fused_mamba_state_scatter_with_mask = None
     _FUSED_IMPORT_ERROR = e
@@ -148,6 +150,33 @@ def _fused_update_like(
 
 
 class TestMambaStateScatterCorrectness(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+    def test_commit_track_step_stays_on_accepted_path(self):
+        """A checkpoint boundary must never select a rejected draft state."""
+        if fused_commit_track_indices is None:
+            self.skipTest(f"fused import failed: {_FUSED_IMPORT_ERROR}")
+
+        device = torch.device("cuda")
+        draft_token_num = 4
+        accept_lens = torch.full((4,), 4, dtype=torch.int64, device=device)
+        accept_index = torch.arange(
+            16, dtype=torch.int64, device=device
+        ).reshape(4, draft_token_num)
+        seq_lens = torch.tensor([63, 62, 61, 60], dtype=torch.int64, device=device)
+
+        last, track = fused_commit_track_indices(
+            accept_index,
+            accept_lens,
+            seq_lens,
+            draft_token_num,
+            64,
+        )
+
+        torch.testing.assert_close(last, torch.full_like(last, 3))
+        torch.testing.assert_close(
+            track, torch.tensor([1, 2, 3, 3], dtype=torch.int64, device=device)
+        )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
     def test_fused_matches_reference(self):
         """Test that fused_mamba_state_scatter_with_mask matches the reference."""

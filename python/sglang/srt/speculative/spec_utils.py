@@ -1004,9 +1004,10 @@ def commit_mamba_states_after_verify(
             seq_post = batch.seq_lens + accept_lens
             to_track_mask = seq_pre // ti != seq_post // ti
             tracking_point = seq_post // ti * ti
-            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
-                torch.int64
-            )
+            to_track_ith = torch.clamp(
+                torch.minimum(tracking_point - seq_pre, accept_lens - 1),
+                min=0,
+            ).to(torch.int64)
             candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
             mamba_steps_to_track = torch.where(
                 to_track_mask, candidate, torch.full_like(candidate, -1)

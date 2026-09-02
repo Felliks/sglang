@@ -753,7 +753,10 @@ def _fused_commit_track_indices_kernel(
         post = pre + al
         cross = (pre // interval) != (post // interval)
         tp = (post // interval) * interval
-        ti = tp - pre - 1
+        # The interval boundary can land at or beyond the last accepted
+        # speculative node.  Select only a state that was actually accepted;
+        # otherwise the radix checkpoint can capture a rejected draft state.
+        ti = tl.minimum(tp - pre, al - 1)
         ti = tl.where(ti < 0, 0, ti)
         cand = tl.load(accept_index_ptr + base + ti).to(tl.int64) - base
         tl.store(track_steps_out_ptr + b, tl.where(cross, cand, -1))
